@@ -1,4 +1,4 @@
-"""Core agent loop: planning, building, validation, and completeness checking."""
+"""Core agent: 5-phase pipeline (requirements -> parts -> plan -> generate -> repair)."""
 
 import json
 import logging
@@ -7,18 +7,36 @@ import sys
 from pathlib import Path
 
 from . import config
-from .llm import OllamaChat
-from .prompts import SYSTEM_PROMPT, PLANNING_PROMPT
-from .tools import TOOL_DEFINITIONS, TOOL_DISPATCH, validate_decl
+from .llm import create_chat
+from .prompts import (
+    REQUIREMENTS_PROMPT,
+    PARTS_PROMPT,
+    DESIGN_PLAN_PROMPT,
+    DECL_GENERATION_PROMPT,
+    REPAIR_PROMPT,
+)
+from .tools import (
+    TOOL_DEFINITIONS,
+    TOOL_DISPATCH,
+    validate_decl_structured,
+    _fix_common_issues,
+)
 
 logger = logging.getLogger(__name__)
 
 _DECL_FENCE_RE = re.compile(r"```(?:decl)?\s*\n(.*?)```", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
+# Tools for Phase 2 only (parts discovery + save datasheet-derived DECL to stdlib)
+PARTS_PHASE_TOOL_NAMES = (
+    "list_stdlib", "read_stdlib_file", "search_parts", "get_part_datasheet", "save_to_stdlib",
+)
+PARTS_PHASE_TOOLS = [t for t in TOOL_DEFINITIONS if t["function"]["name"] in PARTS_PHASE_TOOL_NAMES]
+PARTS_PHASE_DISPATCH = {k: v for k, v in TOOL_DISPATCH.items() if k in PARTS_PHASE_TOOL_NAMES}
+
 
 def _extract_decl(text: str) -> str | None:
-    """Extract the last fenced code block from the assistant's response."""
+    """Extract the last fenced decl block from the assistant's response."""
     matches = _DECL_FENCE_RE.findall(text)
     if not matches:
         return None
@@ -44,6 +62,24 @@ def _extract_json(text: str) -> dict | None:
     return None
 
 
+def _mandatory_inventory_from_requirements(requirements: dict) -> list[dict]:
+    """Build inventory-like list for completeness check from requirements JSON."""
+    inventory: list[dict] = []
+    for item in requirements.get("explicit_parts", []):
+        name = item.get("name") or item.get("part")
+        if name:
+            inventory.append({"name": name, "purpose": item.get("reason", ""), "check_terms": [name]})
+    for item in requirements.get("implied_blocks", []):
+        name = item.get("name")
+        if name:
+            inventory.append({"name": name, "purpose": item.get("reason", ""), "check_terms": [name]})
+    for item in requirements.get("support_components", []):
+        name = item.get("name")
+        if name:
+            inventory.append({"name": name, "purpose": item.get("reason", ""), "check_terms": [name]})
+    return inventory
+
+
 def _check_completeness(decl_code: str, inventory: list[dict]) -> list[str]:
     """Check which inventory items are missing from the generated .decl code."""
     code_lower = decl_code.lower()
@@ -56,194 +92,281 @@ def _check_completeness(decl_code: str, inventory: list[dict]) -> list[str]:
     return missing
 
 
+def _log_step(msg: str) -> None:
+    logger.info(msg)
+    print(f"  [{msg}]", file=sys.stderr)
+
+
+def _log_phase_to_prompts_file(phase_label: str) -> None:
+    """Write a phase header to the prompts log file so the next LLM block is identifiable."""
+    path = getattr(config, "PROMPTS_LOG_PATH", None)
+    if path is None:
+        return
+    try:
+        from datetime import datetime, timezone
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")
+            f.write("# " + "=" * 76 + "\n")
+            f.write(f"# AGENT PHASE: {phase_label}\n")
+            f.write("# " + "=" * 76 + "\n\n")
+    except OSError as exc:
+        logger.debug("Failed to write phase to prompts log: %s", exc)
+
+
 # ---------------------------------------------------------------------------
-# Phase 1: Planning -- extract requirements into a structured inventory
+# Phase 1: Requirements extraction
 # ---------------------------------------------------------------------------
 
-def _run_planning_phase(prompt: str, *, model: str | None, ollama_url: str | None) -> tuple[list[dict], str]:
-    """Ask the LLM to extract a structured component inventory from the prompt.
-
-    Returns (inventory_list, planning_text).
-    """
-    _log_step("Phase 1: Planning -- extracting component inventory")
-    planner = OllamaChat(
-        system_prompt=PLANNING_PROMPT,
-        tools=[],
-        tool_dispatch={},
-        model=model,
-        base_url=ollama_url,
+def _run_phase1_requirements(
+    user_prompt: str,
+    *,
+    backend: str,
+    model: str | None,
+    ollama_url: str | None,
+) -> dict:
+    _log_step("Phase 1: Requirements extraction")
+    _log_phase_to_prompts_file("Phase 1: Requirements extraction")
+    chat = create_chat(
+        backend, REQUIREMENTS_PROMPT, tools=[], tool_dispatch={},
+        model=model, ollama_url=ollama_url,
     )
-
-    response = planner.send(prompt)
-    _log_step(f"Planning response ({len(response)} chars)")
-
-    inventory = []
+    response = chat.send(user_prompt)
     obj = _extract_json(response)
-    if obj and "inventory" in obj:
-        inventory = obj["inventory"]
-    elif obj and isinstance(obj, dict):
-        for key in ("components", "items", "parts"):
-            if key in obj and isinstance(obj[key], list):
-                inventory = obj[key]
-                break
-
-    if not inventory:
-        _log_step("WARNING: Could not parse structured inventory, using raw plan")
-        return [], response
-
-    _log_step(f"Extracted inventory: {len(inventory)} items")
-    for item in inventory:
-        _log_step(f"  - {item.get('name', '?')}: {item.get('purpose', '?')}")
-    return inventory, response
+    if not obj or not isinstance(obj, dict):
+        _log_step("WARNING: No valid requirements JSON; using minimal brief")
+        return {
+            "functions": [],
+            "constraints": [],
+            "explicit_parts": [],
+            "implied_blocks": [],
+            "power_requirements": [],
+            "interfaces": [],
+            "support_components": [],
+            "assumptions": [],
+            "open_questions": [],
+        }
+    _log_step(f"Requirements: {len(obj.get('explicit_parts', []))} explicit, {len(obj.get('implied_blocks', []))} implied")
+    return obj
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Building -- generate the .decl file with inventory enforcement
+# Phase 2: Part / stdlib discovery (with tool loop)
 # ---------------------------------------------------------------------------
 
-def _format_inventory_prompt(prompt: str, inventory: list[dict], plan_text: str) -> str:
-    """Build the user message for the build phase, including the mandatory inventory."""
-    lines = [
-        f"Design request: {prompt}",
-        "",
-        "## MANDATORY COMPONENT INVENTORY",
-        "",
-        "You MUST include ALL of the following in your .decl output.",
-        "Every item must appear as a `component` definition AND as an `instance` in the schematic.",
-        "Do NOT skip any item. Do NOT substitute different parts than what is listed.",
-        "If the user specified a particular MCU or IC, use EXACTLY that part.",
-        "",
-    ]
-    for i, item in enumerate(inventory, 1):
-        name = item.get("name", "?")
-        purpose = item.get("purpose", "")
-        search_hint = item.get("search_hint", "")
-        lines.append(f"{i}. **{name}** -- {purpose}")
-        if search_hint:
-            lines.append(f"   Search hint: `{search_hint}`")
-    lines.append("")
-    lines.append(
-        "## WORKFLOW\n"
-        "1. Search parts DB for each non-passive component to get real pin info.\n"
-        "2. Use `read_stdlib_file` for Resistor, Capacitor, LED, CH32V003 if available.\n"
-        "3. For ICs: use ONLY the attributes/types supported by DECL (Resistance, Capacitance,\n"
-        "   Voltage, Current, Power, Frequency, Percentage, DataSize, VoltageRange, Package, Color).\n"
-        "   Do NOT invent new attribute types like Force, Distance, String.\n"
-        "4. For pin names: use only alphanumeric characters and underscores. No # or special chars.\n"
-        "5. Build the complete .decl, then validate_decl once.\n"
-        "6. Fix any errors and output the final file in a ```decl code block."
+def _run_phase2_parts(
+    requirements: dict,
+    *,
+    backend: str,
+    model: str | None,
+    ollama_url: str | None,
+) -> dict:
+    _log_step("Phase 2: Part selection / library discovery")
+    _log_phase_to_prompts_file("Phase 2: Part selection / library discovery")
+    chat = create_chat(
+        backend, PARTS_PROMPT, PARTS_PHASE_TOOLS, PARTS_PHASE_DISPATCH,
+        model=model, ollama_url=ollama_url,
     )
-    return "\n".join(lines)
+    user_msg = (
+        "Design brief (use the tools to look up stdlib and parts, then output the selection JSON):\n"
+        + json.dumps(requirements, indent=2)
+    )
+    response = chat.send(user_msg)
+    obj = _extract_json(response)
+    if not obj or not isinstance(obj, dict):
+        _log_step("WARNING: No valid parts JSON; using empty selection")
+        return {"selected_components": [], "nets_needed": [], "design_rules": [], "unresolved": []}
+    _log_step(f"Parts: {len(obj.get('selected_components', []))} components selected")
+    return obj
 
+
+# ---------------------------------------------------------------------------
+# Phase 3: Design plan
+# ---------------------------------------------------------------------------
+
+def _run_phase3_design_plan(
+    requirements: dict,
+    parts: dict,
+    *,
+    backend: str,
+    model: str | None,
+    ollama_url: str | None,
+) -> dict:
+    _log_step("Phase 3: Design plan (connection plan)")
+    _log_phase_to_prompts_file("Phase 3: Design plan (connection plan)")
+    chat = create_chat(
+        backend, DESIGN_PLAN_PROMPT, tools=[], tool_dispatch={},
+        model=model, ollama_url=ollama_url,
+    )
+    user_msg = (
+        "Requirements and selected parts. Output the connection plan JSON only.\n\n"
+        "Requirements:\n" + json.dumps(requirements, indent=2) + "\n\n"
+        "Parts:\n" + json.dumps(parts, indent=2)
+    )
+    response = chat.send(user_msg)
+    obj = _extract_json(response)
+    if not obj or not isinstance(obj, dict):
+        _log_step("WARNING: No valid design plan JSON")
+        return {"instances": [], "nets": [], "connections": [], "power_topology": [], "protocol_bindings": [], "checks": []}
+    _log_step(f"Plan: {len(obj.get('instances', []))} instances, {len(obj.get('nets', []))} nets")
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: DECL generation
+# ---------------------------------------------------------------------------
+
+def _run_phase4_generate_decl(
+    design_plan: dict,
+    *,
+    backend: str,
+    model: str | None,
+    ollama_url: str | None,
+) -> str | None:
+    _log_step("Phase 4: DECL generation")
+    _log_phase_to_prompts_file("Phase 4: DECL generation")
+    chat = create_chat(
+        backend, DECL_GENERATION_PROMPT, tools=[], tool_dispatch={},
+        model=model, ollama_url=ollama_url,
+    )
+    user_msg = (
+        "Emit only a ```decl code block containing the complete .decl file for this plan:\n\n"
+        + json.dumps(design_plan, indent=2)
+    )
+    response = chat.send(user_msg)
+    decl = _extract_decl(response)
+    if decl:
+        decl = _fix_common_issues(decl)
+        _log_step(f"Generated .decl ({len(decl)} chars)")
+    else:
+        _log_step("WARNING: No decl block in response")
+    return decl
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Validator repair loop
+# ---------------------------------------------------------------------------
+
+def _run_phase5_repair_loop(
+    decl_code: str,
+    *,
+    backend: str,
+    model: str | None,
+    ollama_url: str | None,
+) -> str:
+    _log_step("Phase 5: Validation and repair")
+    _log_phase_to_prompts_file("Phase 5: Validation and repair")
+    chat = create_chat(
+        backend, REPAIR_PROMPT, tools=[], tool_dispatch={},
+        model=model, ollama_url=ollama_url,
+    )
+    decl = decl_code
+    for iteration in range(config.MAX_AGENT_ITERATIONS):
+        human_output, structured_errors = validate_decl_structured(decl)
+        is_ok = human_output.strip().startswith("OK:")
+
+        if is_ok:
+            _log_step("Validation passed")
+            return decl
+
+        _log_step(f"Repair iteration {iteration + 1}: {len(structured_errors)} structured errors")
+        err_blob = human_output
+        if structured_errors:
+            err_blob += "\n\nStructured errors (for repair):\n" + json.dumps(structured_errors, indent=2)
+        user_msg = (
+            "Fix the following DECL so it passes validation. Output ONLY a ```decl block.\n\n"
+            "Validation output:\n" + err_blob + "\n\n"
+            "Current DECL (fix the errors in it):\n\n```decl\n" + decl + "\n```"
+        )
+        response = chat.send(user_msg)
+        repaired = _extract_decl(response)
+        if not repaired:
+            _log_step("No decl block in repair response; keeping last version")
+            break
+        decl = _fix_common_issues(repaired)
+    return decl
+
+
+# ---------------------------------------------------------------------------
+# Main entry: 5-phase pipeline
+# ---------------------------------------------------------------------------
 
 def run_agent(
     prompt: str,
     output_path: str = "output.decl",
     *,
+    backend: str | None = None,
     model: str | None = None,
     ollama_url: str | None = None,
 ) -> Path:
-    """Run the circuit design agent and write the result to *output_path*."""
+    """Run the 5-phase circuit design agent and write the result to *output_path*."""
+    backend = backend or config.BACKEND
 
-    # Phase 1: Planning
-    inventory, plan_text = _run_planning_phase(
-        prompt, model=model, ollama_url=ollama_url,
+    # Phase 1: Requirements
+    requirements = _run_phase1_requirements(
+        prompt, backend=backend, model=model, ollama_url=ollama_url,
     )
 
-    # Phase 2: Building
-    _log_step("Phase 2: Building -- generating .decl file")
-    chat = OllamaChat(
-        system_prompt=SYSTEM_PROMPT,
-        tools=TOOL_DEFINITIONS,
-        tool_dispatch=TOOL_DISPATCH,
-        model=model,
-        base_url=ollama_url,
+    # Phase 2: Parts (with tools)
+    parts = _run_phase2_parts(
+        requirements, backend=backend, model=model, ollama_url=ollama_url,
     )
 
-    if inventory:
-        build_prompt = _format_inventory_prompt(prompt, inventory, plan_text)
-    else:
-        build_prompt = prompt
+    # Phase 3: Design plan
+    design_plan = _run_phase3_design_plan(
+        requirements, parts, backend=backend, model=model, ollama_url=ollama_url,
+    )
 
-    response = chat.send(build_prompt)
+    # Phase 4: Generate DECL
+    decl_code = _run_phase4_generate_decl(
+        design_plan, backend=backend, model=model, ollama_url=ollama_url,
+    )
+    if not decl_code:
+        print("Error: agent did not produce a .decl file.", file=sys.stderr)
+        sys.exit(1)
 
-    # Phase 3: Validation loop with completeness checking
-    for iteration in range(config.MAX_AGENT_ITERATIONS):
-        decl_code = _extract_decl(response)
+    # Phase 5: Validate and repair until OK
+    decl_code = _run_phase5_repair_loop(
+        decl_code, backend=backend, model=model, ollama_url=ollama_url,
+    )
 
-        if decl_code is None and chat.last_validated_content:
-            _log_step(f"Iteration {iteration + 1}: using model's self-validated content")
-            decl_code = chat.last_validated_content
+    # Completeness loop: if required items are missing, ask LLM to add them and re-validate
+    inventory = _mandatory_inventory_from_requirements(requirements)
+    for completeness_iteration in range(config.MAX_AGENT_ITERATIONS):
+        if not inventory:
+            break
+        missing = _check_completeness(decl_code, inventory)
+        if not missing:
+            break
+        _log_step(f"Completeness: {len(missing)} required item(s) missing; asking LLM to add them")
+        for m in missing:
+            _log_step(f"  {m}")
+        _log_phase_to_prompts_file("Completeness: add missing components")
+        chat = create_chat(
+            backend, REPAIR_PROMPT, tools=[], tool_dispatch={},
+            model=model, ollama_url=ollama_url,
+        )
+        missing_text = "\n".join(missing)
+        user_msg = (
+            "The .decl file below is valid but INCOMPLETE. The following required components "
+            "are MISSING from the schematic:\n\n"
+            f"{missing_text}\n\n"
+            "Add these components (define them as component if needed), add instances for them, "
+            "and connect them appropriately. Output the complete corrected .decl in a ```decl block.\n\n"
+            "Current .decl:\n\n"
+            f"```decl\n{decl_code}\n```"
+        )
+        response = chat.send(user_msg)
+        new_decl = _extract_decl(response)
+        if not new_decl:
+            _log_step("No decl block in response; keeping current version")
+            break
+        decl_code = _fix_common_issues(new_decl)
+        # Re-validate in case the LLM introduced errors
+        decl_code = _run_phase5_repair_loop(
+            decl_code, backend=backend, model=model, ollama_url=ollama_url,
+        )
 
-        if decl_code is None:
-            _log_step(f"Iteration {iteration + 1}: no .decl block yet, nudging model")
-            response = chat.send(
-                "Please produce the complete .decl file now. "
-                "Put it inside a ```decl fenced code block. "
-                "Make sure EVERY item from the mandatory inventory is included."
-            )
-            continue
-
-        _log_step(f"Iteration {iteration + 1}: extracted .decl ({len(decl_code)} chars)")
-
-        # Syntax/semantic validation
-        validation = validate_decl(content=decl_code)
-        _log_step(f"Validation: {validation[:200]}")
-
-        is_ok = validation.strip().startswith("OK:")
-        has_errors = "Error:" in validation and not is_ok
-
-        if has_errors:
-            _log_step(f"Iteration {iteration + 1}: syntax errors, feeding back")
-            response = chat.send(
-                f"The .decl file has validation errors. Fix them and output the "
-                f"corrected file in a ```decl code block.\n\nValidation output:\n{validation}"
-            )
-            continue
-
-        # Completeness check
-        if inventory:
-            missing = _check_completeness(decl_code, inventory)
-            if missing and iteration < config.MAX_AGENT_ITERATIONS - 1:
-                _log_step(f"Iteration {iteration + 1}: {len(missing)} missing components")
-                for m in missing:
-                    _log_step(f"  MISSING: {m}")
-                missing_text = "\n".join(missing)
-                response = chat.send(
-                    f"The .decl file passes syntax validation but is INCOMPLETE. "
-                    f"The following required components are MISSING from the schematic:\n\n"
-                    f"{missing_text}\n\n"
-                    f"You MUST search for these parts using `search_parts`, define them as "
-                    f"components, and add them as instances in the schematic with proper "
-                    f"connections. Output the complete corrected .decl in a ```decl code block."
-                )
-                continue
-
-        if is_ok:
-            out = Path(output_path)
-            out.write_text(decl_code + "\n")
-            warnings = [l for l in validation.splitlines() if l.startswith("Warning:")]
-            print(f"\nCircuit written to {out}")
-            if warnings:
-                print(f"  ({len(warnings)} warning(s))")
-            if inventory:
-                final_missing = _check_completeness(decl_code, inventory)
-                if final_missing:
-                    print(f"  NOTE: {len(final_missing)} inventory item(s) may still be missing")
-            return out
-
-    _log_step("Max iterations reached")
-    decl_code = _extract_decl(response) or (chat.last_validated_content if chat.last_validated_content else None)
-    if decl_code:
-        out = Path(output_path)
-        out.write_text(decl_code + "\n")
-        print(f"\nCircuit written to {out} (max iterations reached)")
-        return out
-
-    print("Error: agent did not produce a .decl file.", file=sys.stderr)
-    sys.exit(1)
-
-
-def _log_step(msg: str):
-    logger.info(msg)
-    print(f"  [{msg}]", file=sys.stderr)
+    out = Path(output_path)
+    out.write_text(decl_code + "\n")
+    print(f"\nCircuit written to {out}")
+    return out

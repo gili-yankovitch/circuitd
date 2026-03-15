@@ -1,64 +1,129 @@
-"""Ollama chat client with native tool-calling support."""
+"""LLM chat clients with tool-calling support (Ollama and OpenAI)."""
+
+from __future__ import annotations
 
 import json
 import logging
-import requests
+import re
+import time
+from datetime import datetime, timezone
+from abc import ABC, abstractmethod
 from typing import Any, Callable
 
+import requests
+
 from . import config
+from .prompts import STATE_SUMMARY_PROMPT
 
 logger = logging.getLogger(__name__)
 
+# Max chars per message in prompts log (avoid huge files from tool results)
+_PROMPTS_LOG_MAX_MESSAGE_CHARS = 100_000
 
-class OllamaChat:
-    """Manages a multi-turn conversation with an Ollama model that supports tool calls."""
+
+def _log_prompts_to_file(messages: list[dict], label: str = "") -> None:
+    """Append a formatted dump of messages (prompts sent to the AI) to the prompts log file."""
+    path = getattr(config, "PROMPTS_LOG_PATH", None)
+    if path is None:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"[{datetime.now(timezone.utc).isoformat()}] {label}\n")
+            f.write("=" * 80 + "\n")
+            for i, m in enumerate(messages):
+                role = m.get("role", "?")
+                content = m.get("content") or ""
+                if len(content) > _PROMPTS_LOG_MAX_MESSAGE_CHARS:
+                    content = content[:_PROMPTS_LOG_MAX_MESSAGE_CHARS] + "\n... (truncated)\n"
+                f.write(f"\n--- message {i + 1} role={role} ---\n")
+                f.write(content)
+                f.write("\n")
+                tool_calls = m.get("tool_calls") or []
+                if tool_calls:
+                    f.write("[tool_calls]\n")
+                    for tc in tool_calls:
+                        fn = tc.get("function") or tc
+                        name = fn.get("name", "?")
+                        args = fn.get("arguments", "")
+                        if isinstance(args, dict):
+                            args = json.dumps(args, indent=2, default=str)
+                        if len(args) > 5000:
+                            args = args[:5000] + "\n... (truncated)"
+                        f.write(f"  {name}: {args}\n")
+            f.write("\n")
+    except OSError as exc:
+        logger.warning("Failed to write prompts log: %s", exc)
+
+
+def _log_response_to_file(
+    content: str,
+    tool_calls: list[dict] | None = None,
+    label: str = "",
+) -> None:
+    """Append the LLM response (content and tool_calls) to the prompts log file."""
+    path = getattr(config, "PROMPTS_LOG_PATH", None)
+    if path is None:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"[{datetime.now(timezone.utc).isoformat()}] {label}\n")
+            f.write("-" * 80 + "\n")
+            f.write("\n--- response content ---\n")
+            if len(content) > _PROMPTS_LOG_MAX_MESSAGE_CHARS:
+                content = content[:_PROMPTS_LOG_MAX_MESSAGE_CHARS] + "\n... (truncated)\n"
+            f.write(content)
+            f.write("\n")
+            if tool_calls:
+                f.write("\n--- response tool_calls ---\n")
+                for tc in tool_calls:
+                    name = tc.get("name", "?")
+                    args = tc.get("arguments", "")
+                    if isinstance(args, dict):
+                        args = json.dumps(args, indent=2, default=str)
+                    if len(str(args)) > 5000:
+                        args = str(args)[:5000] + "\n... (truncated)"
+                    f.write(f"  {name}: {args}\n")
+            f.write("\n")
+    except OSError as exc:
+        logger.warning("Failed to write response to prompts log: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Abstract base
+# ---------------------------------------------------------------------------
+
+class ChatBase(ABC):
+    """Common interface for LLM chat backends."""
+
+    SUMMARY_CHAR_THRESHOLD = 35000
+    KEEP_RECENT_MESSAGES = 6
 
     def __init__(
         self,
         system_prompt: str,
         tools: list[dict],
         tool_dispatch: dict[str, Callable[..., str]],
-        *,
-        model: str | None = None,
-        base_url: str | None = None,
     ):
-        self.base_url = (base_url or config.OLLAMA_URL).rstrip("/")
-        self.model = model or config.OLLAMA_MODEL
         self.tools = tools
         self.tool_dispatch = tool_dispatch
+        self._system_prompt = system_prompt
         self.messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
+        self._last_validated: str | None = None
 
-    def _call_api(self, *, include_tools: bool = True) -> dict:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": self.messages,
-            "stream": False,
-            "options": {"num_ctx": config.OLLAMA_NUM_CTX, "num_gpu": 99},
-        }
-        if include_tools and self.tools:
-            payload["tools"] = self.tools
+    @property
+    def last_validated_content(self) -> str | None:
+        return self._last_validated
 
-        for attempt in range(3):
-            try:
-                resp = requests.post(
-                    f"{self.base_url}/api/chat",
-                    json=payload,
-                    timeout=config.OLLAMA_TIMEOUT,
-                )
-                resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.ReadTimeout:
-                logger.warning("Ollama timeout (attempt %d/3)", attempt + 1)
-                if attempt == 2:
-                    raise
-            except requests.exceptions.ConnectionError:
-                logger.warning("Ollama connection error (attempt %d/3)", attempt + 1)
-                if attempt == 2:
-                    raise
-                import time
-                time.sleep(5)
+    def send(self, user_message: str) -> str:
+        self._maybe_summarize()
+        self.messages.append({"role": "user", "content": user_message})
+        return self._run_loop()
 
     def _execute_tool(self, name: str, arguments: dict) -> str:
         fn = self.tool_dispatch.get(name)
@@ -71,39 +136,154 @@ class OllamaChat:
             logger.warning("Tool %s raised: %s", name, exc)
             return json.dumps({"error": str(exc)})
 
-    def send(self, user_message: str) -> str:
-        """Send a user message and run the full tool-call loop until
-        the model produces a final text response.
+    # ------------------------------------------------------------------
+    # Context management
+    # ------------------------------------------------------------------
 
-        Returns the assistant's final text content.
+    def _total_chars(self) -> int:
+        total = 0
+        for m in self.messages:
+            total += len(m.get("content") or "")
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                total += len(fn.get("arguments") or "")
+        return total
+
+    def _extract_state_json(self, text: str) -> str:
+        """Extract JSON string from summary response (e.g. from ```json block)."""
+        for pattern in [re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL), re.compile(r"(\{.*\})", re.DOTALL)]:
+            for match in pattern.findall(text):
+                s = match.strip() if isinstance(match, str) else match
+                if s.startswith("{"):
+                    return s
+        return text
+
+    def _maybe_summarize(self):
+        """If context is over budget, summarize older messages and compact."""
+        total = self._total_chars()
+        if total < self.SUMMARY_CHAR_THRESHOLD:
+            return
+
+        logger.info(
+            "Context at %d chars (threshold %d), summarizing...",
+            total, self.SUMMARY_CHAR_THRESHOLD,
+        )
+
+        system_msg = self.messages[0]
+        rest = self.messages[1:]
+
+        keep = min(self.KEEP_RECENT_MESSAGES, len(rest))
+        to_summarize = rest[: len(rest) - keep]
+        to_keep = rest[len(rest) - keep :]
+
+        if not to_summarize:
+            return
+
+        transcript = self._format_for_summary(to_summarize)
+
+        try:
+            summary = self._call_summary_api(transcript)
+            logger.info("Summary produced (%d chars)", len(summary))
+        except Exception as exc:
+            logger.warning("Summary call failed (%s), falling back to trim", exc)
+            self._trim_tool_results()
+            return
+
+        # Prefer structured state JSON; fall back to raw summary if not valid JSON
+        state_json = summary
+        try:
+            parsed = json.loads(self._extract_state_json(summary))
+            if isinstance(parsed, dict):
+                state_json = json.dumps(parsed, indent=2)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        self.messages = [
+            system_msg,
+            {"role": "user", "content": f"[CONTEXT COMPRESSED]\nCurrent state:\n{state_json}"},
+            {"role": "assistant", "content": "Understood. I have the context from the state above. I will continue the circuit design from where we left off."},
+            *to_keep,
+        ]
+        logger.info(
+            "Context compacted: %d -> %d chars, %d messages",
+            total, self._total_chars(), len(self.messages),
+        )
+
+    def _format_for_summary(self, messages: list[dict]) -> str:
+        """Turn a slice of messages into a readable transcript for the summarizer."""
+        parts: list[str] = []
+        for m in messages:
+            role = m.get("role", "?")
+            content = (m.get("content") or "")[:2000]
+            tool_calls = m.get("tool_calls") or []
+
+            if role == "tool":
+                parts.append(f"[tool result]: {content[:800]}")
+            elif tool_calls:
+                calls_desc = []
+                for tc in tool_calls:
+                    fn = tc.get("function") or tc
+                    name = fn.get("name", "?")
+                    args = fn.get("arguments", "")
+                    if isinstance(args, dict):
+                        args = json.dumps(args, default=str)
+                    calls_desc.append(f"  {name}({str(args)[:200]})")
+                parts.append(f"[assistant calls tools]:\n" + "\n".join(calls_desc))
+                if content:
+                    parts.append(f"[assistant text]: {content[:500]}")
+            elif role == "assistant":
+                parts.append(f"[assistant]: {content}")
+            elif role == "user":
+                parts.append(f"[user]: {content}")
+
+        full = "\n\n".join(parts)
+        max_len = 12000
+        if len(full) > max_len:
+            full = full[:max_len] + "\n... (transcript truncated) ..."
+        return full
+
+    def _trim_tool_results(self):
+        """Fallback: shorten old tool results if summary fails."""
+        for m in self.messages:
+            if m.get("role") == "tool" and len(m.get("content") or "") > 300:
+                m["content"] = m["content"][:250] + "\n... (trimmed) ..."
+
+    @abstractmethod
+    def _call_summary_api(self, transcript: str) -> str:
+        """Call the LLM (no tools) to produce a summary of the transcript."""
+
+    @abstractmethod
+    def _call_api(self) -> tuple[str, list[dict]]:
+        """Call the LLM API. Returns (content, tool_calls).
+
+        Each tool_call is {"name": str, "arguments": dict, "id": str|None}.
         """
-        self.messages.append({"role": "user", "content": user_message})
-        return self._run_loop()
 
-    @property
-    def last_validated_content(self) -> str | None:
-        """The last .decl content that passed validation via a tool call."""
-        return self._last_validated
+    @abstractmethod
+    def _append_assistant(self, content: str, tool_calls: list[dict]) -> None:
+        """Append the assistant's message to self.messages (backend-specific format)."""
+
+    @abstractmethod
+    def _append_tool_result(self, tool_call: dict, result: str) -> None:
+        """Append a tool result to self.messages (backend-specific format)."""
 
     def _run_loop(self) -> str:
-        self._last_validated: str | None = None
+        self._last_validated = None
         validate_ok_count = 0
 
         for _ in range(config.MAX_AGENT_ITERATIONS):
-            data = self._call_api()
-            msg = data.get("message", {})
-            content = msg.get("content", "")
-            tool_calls = msg.get("tool_calls")
-
-            self.messages.append(msg)
+            self._maybe_summarize()
+            _log_prompts_to_file(self.messages, label="LLM request")
+            content, tool_calls = self._call_api()
+            _log_response_to_file(content, tool_calls, label="LLM response")
+            self._append_assistant(content, tool_calls)
 
             if not tool_calls:
                 return content
 
             for tc in tool_calls:
-                fn_info = tc.get("function", {})
-                fn_name = fn_info.get("name", "")
-                fn_args = fn_info.get("arguments", {})
+                fn_name = tc["name"]
+                fn_args = tc["arguments"]
 
                 logger.info("Tool call: %s(%s)", fn_name, json.dumps(fn_args, default=str)[:200])
                 result = self._execute_tool(fn_name, fn_args)
@@ -113,9 +293,237 @@ class OllamaChat:
                     self._last_validated = fn_args.get("content", "")
                     validate_ok_count += 1
                     if validate_ok_count >= 2:
-                        logger.info("Model validated OK twice via tool -- returning content directly")
+                        logger.info("Validated OK twice -- returning content directly")
                         return content or f"```decl\n{self._last_validated}\n```"
 
-                self.messages.append({"role": "tool", "content": result})
+                self._append_tool_result(tc, result)
 
         return content
+
+
+# ---------------------------------------------------------------------------
+# Ollama backend
+# ---------------------------------------------------------------------------
+
+class OllamaChat(ChatBase):
+
+    SUMMARY_CHAR_THRESHOLD = 30000
+
+    def __init__(
+        self,
+        system_prompt: str,
+        tools: list[dict],
+        tool_dispatch: dict[str, Callable[..., str]],
+        *,
+        model: str | None = None,
+        base_url: str | None = None,
+    ):
+        super().__init__(system_prompt, tools, tool_dispatch)
+        self.base_url = (base_url or config.OLLAMA_URL).rstrip("/")
+        self.model = model or config.OLLAMA_MODEL
+
+    def send(self, user_message: str) -> str:
+        self._maybe_summarize()
+        self.messages.append({"role": "user", "content": "/nothink\n" + user_message})
+        return self._run_loop()
+
+    def _call_summary_api(self, transcript: str) -> str:
+        summary_messages = [
+            {"role": "system", "content": STATE_SUMMARY_PROMPT},
+            {"role": "user", "content": "/nothink\n" + transcript},
+        ]
+        _log_prompts_to_file(summary_messages, label="Summary/state compression request")
+        payload = {
+            "model": self.model,
+            "messages": summary_messages,
+            "stream": False,
+            "options": {"num_ctx": config.OLLAMA_NUM_CTX, "num_gpu": 99},
+        }
+        resp = requests.post(
+            f"{self.base_url}/api/chat",
+            json=payload,
+            timeout=config.OLLAMA_TIMEOUT,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("message", {}).get("content", "")
+        _log_response_to_file(content, None, label="Summary/state compression response")
+        return content
+
+    def _call_api(self) -> tuple[str, list[dict]]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": self.messages,
+            "stream": False,
+            "keep_alive": -1,
+            "options": {"num_ctx": config.OLLAMA_NUM_CTX, "num_gpu": 99},
+        }
+        if self.tools:
+            payload["tools"] = self.tools
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/api/chat",
+                    json=payload,
+                    timeout=config.OLLAMA_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except requests.exceptions.ReadTimeout:
+                logger.warning("Ollama timeout (attempt %d/3)", attempt + 1)
+                if attempt == 2:
+                    raise
+            except requests.exceptions.ConnectionError:
+                logger.warning("Ollama connection error (attempt %d/3)", attempt + 1)
+                if attempt == 2:
+                    raise
+                time.sleep(5)
+
+        msg = data.get("message", {})
+        content = msg.get("content", "")
+        raw_calls = msg.get("tool_calls") or []
+        tool_calls = []
+        for tc in raw_calls:
+            fn = tc.get("function", {})
+            tool_calls.append({
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", {}),
+                "id": None,
+                "_raw": tc,
+            })
+        return content, tool_calls
+
+    def _append_assistant(self, content: str, tool_calls: list[dict]) -> None:
+        msg: dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = [tc["_raw"] for tc in tool_calls]
+        self.messages.append(msg)
+
+    def _append_tool_result(self, tool_call: dict, result: str) -> None:
+        self.messages.append({"role": "tool", "content": result})
+
+
+# ---------------------------------------------------------------------------
+# OpenAI backend
+# ---------------------------------------------------------------------------
+
+class OpenAIChat(ChatBase):
+
+    SUMMARY_CHAR_THRESHOLD = 20000
+
+    def __init__(
+        self,
+        system_prompt: str,
+        tools: list[dict],
+        tool_dispatch: dict[str, Callable[..., str]],
+        *,
+        model: str | None = None,
+        api_key: str | None = None,
+    ):
+        super().__init__(system_prompt, tools, tool_dispatch)
+        self.model = model or config.OPENAI_MODEL
+        self._api_key = api_key or config.OPENAI_API_KEY
+        if not self._api_key:
+            raise RuntimeError("OpenAI API key not found. Place it in openai.key")
+
+        from openai import OpenAI
+        self._client = OpenAI(api_key=self._api_key, timeout=config.OPENAI_TIMEOUT)
+
+    def _call_summary_api(self, transcript: str) -> str:
+        summary_messages = [
+            {"role": "system", "content": STATE_SUMMARY_PROMPT},
+            {"role": "user", "content": transcript},
+        ]
+        _log_prompts_to_file(summary_messages, label="Summary/state compression request (OpenAI)")
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=summary_messages,
+        )
+        content = response.choices[0].message.content or ""
+        _log_response_to_file(content, None, label="Summary/state compression response (OpenAI)")
+        return content
+
+    def _call_api(self) -> tuple[str, list[dict]]:
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": self.messages,
+        }
+        if self.tools:
+            kwargs["tools"] = self.tools
+
+        for attempt in range(3):
+            try:
+                response = self._client.chat.completions.create(**kwargs)
+                break
+            except Exception as exc:
+                logger.warning("OpenAI error (attempt %d/3): %s", attempt + 1, exc)
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+
+        choice = response.choices[0]
+        msg = choice.message
+        content = msg.content or ""
+        tool_calls = []
+        for tc in msg.tool_calls or []:
+            try:
+                args = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            tool_calls.append({
+                "name": tc.function.name,
+                "arguments": args,
+                "id": tc.id,
+                "_raw_msg": msg,
+            })
+        return content, tool_calls
+
+    def _append_assistant(self, content: str, tool_calls: list[dict]) -> None:
+        msg: dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["arguments"]),
+                    },
+                }
+                for tc in tool_calls
+            ]
+        self.messages.append(msg)
+
+    def _append_tool_result(self, tool_call: dict, result: str) -> None:
+        self.messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "content": result,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def create_chat(
+    backend: str,
+    system_prompt: str,
+    tools: list[dict],
+    tool_dispatch: dict[str, Callable[..., str]],
+    *,
+    model: str | None = None,
+    ollama_url: str | None = None,
+    api_key: str | None = None,
+) -> ChatBase:
+    """Create the appropriate chat backend."""
+    if backend == "openai":
+        return OpenAIChat(
+            system_prompt, tools, tool_dispatch,
+            model=model, api_key=api_key,
+        )
+    return OllamaChat(
+        system_prompt, tools, tool_dispatch,
+        model=model, base_url=ollama_url,
+    )
