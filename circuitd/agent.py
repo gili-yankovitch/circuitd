@@ -14,6 +14,7 @@ from .prompts import (
     DESIGN_PLAN_PROMPT,
     DECL_GENERATION_PROMPT,
     REPAIR_PROMPT,
+    COMPLETENESS_VERIFY_PROMPT,
 )
 from .tools import (
     TOOL_DEFINITIONS,
@@ -86,7 +87,7 @@ def _normalize_for_match(text: str) -> str:
 
 
 def _check_completeness(decl_code: str, inventory: list[dict]) -> list[str]:
-    """Check which inventory items are missing from the generated .decl code."""
+    """Check which inventory items are missing from the generated .decl code (heuristic: substring match)."""
     code_lower = decl_code.lower()
     code_normalized = _normalize_for_match(decl_code)
     missing = []
@@ -100,6 +101,59 @@ def _check_completeness(decl_code: str, inventory: list[dict]) -> list[str]:
         if not found:
             missing.append(f"- {name}: {item.get('purpose', '(no description)')}")
     return missing
+
+
+def _verify_completeness_with_llm(
+    decl_code: str,
+    heuristic_missing: list[str],
+    requirements: dict,
+    *,
+    backend: str,
+    model: str | None,
+    ollama_url: str | None,
+) -> list[str]:
+    """Ask LLM which heuristic 'missing' items are actually missing vs already present in DECL.
+    Returns the list of items that are actually missing (for the add-missing step).
+    """
+    if not heuristic_missing:
+        return []
+    _log_phase_to_prompts_file("Completeness: LLM verification of missing items")
+    chat = create_chat(
+        backend, COMPLETENESS_VERIFY_PROMPT, tools=[], tool_dispatch={},
+        model=model, ollama_url=ollama_url,
+    )
+    missing_blob = "\n".join(heuristic_missing)
+    user_msg = (
+        "Flagged as missing (from a simple text match; may be false positives):\n\n"
+        f"{missing_blob}\n\n"
+        "Requirements summary (for context):\n"
+        + json.dumps(
+            {
+                "explicit_parts": requirements.get("explicit_parts", []),
+                "implied_blocks": requirements.get("implied_blocks", []),
+                "support_components": requirements.get("support_components", []),
+            },
+            indent=2,
+        )
+        + "\n\nDECL file to check:\n\n```decl\n"
+        + decl_code
+        + "\n```\n\n"
+        "Output ONLY a JSON object with 'actually_missing' and 'already_present' arrays."
+    )
+    response = chat.send(user_msg)
+    obj = _extract_json(response)
+    if not obj or not isinstance(obj, dict):
+        _log_step("Completeness verification: no valid JSON; treating all flagged as already present")
+        return []
+    actually_missing = obj.get("actually_missing") or []
+    if not isinstance(actually_missing, list):
+        actually_missing = []
+    already_present = obj.get("already_present") or []
+    if isinstance(already_present, list) and already_present:
+        _log_step(f"Completeness verification: {len(already_present)} item(s) already present in DECL")
+    if actually_missing:
+        _log_step(f"Completeness verification: {len(actually_missing)} item(s) actually missing")
+    return actually_missing
 
 
 def _log_step(msg: str) -> None:
@@ -339,23 +393,31 @@ def run_agent(
         decl_code, backend=backend, model=model, ollama_url=ollama_url,
     )
 
-    # Completeness loop: if required items are missing, ask LLM to add them and re-validate
+    # Completeness loop: heuristic flags possible missing items; LLM verifies which are actually missing
     inventory = _mandatory_inventory_from_requirements(requirements)
     for completeness_iteration in range(config.MAX_AGENT_ITERATIONS):
         if not inventory:
             break
-        missing = _check_completeness(decl_code, inventory)
-        if not missing:
+        heuristic_missing = _check_completeness(decl_code, inventory)
+        if not heuristic_missing:
             break
-        _log_step(f"Completeness: {len(missing)} required item(s) missing; asking LLM to add them")
-        for m in missing:
+        _log_step(f"Completeness: heuristic flagged {len(heuristic_missing)} item(s); verifying with LLM")
+        actually_missing = _verify_completeness_with_llm(
+            decl_code, heuristic_missing, requirements,
+            backend=backend, model=model, ollama_url=ollama_url,
+        )
+        if not actually_missing:
+            _log_step("Completeness: all flagged items already present in DECL; done")
+            break
+        _log_step(f"Completeness: {len(actually_missing)} required item(s) actually missing; asking LLM to add them")
+        for m in actually_missing:
             _log_step(f"  {m}")
         _log_phase_to_prompts_file("Completeness: add missing components")
         chat = create_chat(
             backend, REPAIR_PROMPT, tools=[], tool_dispatch={},
             model=model, ollama_url=ollama_url,
         )
-        missing_text = "\n".join(missing)
+        missing_text = "\n".join(actually_missing)
         user_msg = (
             "The .decl file below is valid but INCOMPLETE. The following required components "
             "are MISSING from the schematic:\n\n"

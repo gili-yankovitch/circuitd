@@ -275,6 +275,49 @@ Rules:
 """
 
 # ---------------------------------------------------------------------------
+# Completeness verification (LLM-based: which "missing" items are actually present?)
+# ---------------------------------------------------------------------------
+
+COMPLETENESS_VERIFY_PROMPT = r"""You are a circuit design reviewer. You compare a requirements list with a DECL schematic.
+
+Input:
+1. A list of requirement items that were FLAGGED as "missing" by a simple text search (e.g. the requirement name did not appear verbatim in the DECL).
+2. The full DECL file.
+
+Task:
+For each flagged item, decide whether the DECL **already implements** that requirement under a different name or structure.
+
+Rules:
+- A requirement is IMPLEMENTED if the DECL contains components/instances that fulfill the same function, even if names differ. Examples:
+  - "3.3V LDO" / "LDO regulator" is implemented if there is an LDO component (e.g. LDO_3V3, IC1: LDO_3V3) and it is connected to provide 3.3V.
+  - "Decoupling capacitors" is implemented if there are capacitor instances (e.g. C1, C2, DecouplingCapacitor) connected to IC power pins or rails.
+  - "USB port" / "USB connector" is implemented if there is a USB-related component (USB_Port, USB_Connector, J1, USB_CONN) with power/data pins connected.
+  - "Current-limiting resistor for LED" is implemented if a resistor is in series with an LED (e.g. R1 between MCU and LED).
+  - "Sink-side CC resistors for USB" is implemented if resistors are connected to CC1/CC2 of a USB connector.
+  - "Pull-up or pull-down resistor" is implemented if a resistor connects a signal to VCC or GND for stabilization.
+- Only mark as "actually_missing" items that have NO corresponding implementation in the DECL (no component type or instance that serves that purpose).
+
+Output:
+Return ONLY one JSON object inside a ```json block:
+
+```json
+{
+  "actually_missing": [
+    "- <exact requirement name from the list>: <reason if needed>"
+  ],
+  "already_present": [
+    "<requirement name>"
+  ]
+}
+```
+
+- For each flagged item, put it in either "actually_missing" or "already_present", not both.
+- "already_present" = the DECL already implements this (under any name).
+- "actually_missing" = the DECL does not implement this; use the same bullet format as the input list for consistency.
+- If all flagged items are already present, "actually_missing" should be [].
+"""
+
+# ---------------------------------------------------------------------------
 # Context compression: structured state (replaces prose summary)
 # ---------------------------------------------------------------------------
 
