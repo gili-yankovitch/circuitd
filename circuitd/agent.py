@@ -80,14 +80,24 @@ def _mandatory_inventory_from_requirements(requirements: dict) -> list[dict]:
     return inventory
 
 
+def _normalize_for_match(text: str) -> str:
+    """Collapse whitespace, underscores, and hyphens so 'Green LED' matches 'Green_LED'."""
+    return re.sub(r"[\s_\-]+", "", text).lower()
+
+
 def _check_completeness(decl_code: str, inventory: list[dict]) -> list[str]:
     """Check which inventory items are missing from the generated .decl code."""
     code_lower = decl_code.lower()
+    code_normalized = _normalize_for_match(decl_code)
     missing = []
     for item in inventory:
         name = item.get("name", "")
         check_terms = item.get("check_terms", [name])
-        if not any(term.lower() in code_lower for term in check_terms):
+        found = any(
+            term.lower() in code_lower or _normalize_for_match(term) in code_normalized
+            for term in check_terms
+        )
+        if not found:
             missing.append(f"- {name}: {item.get('purpose', '(no description)')}")
     return missing
 

@@ -285,8 +285,17 @@ def _fix_common_issues(content: str) -> str:
     """Auto-fix common LLM mistakes in .decl source before validation."""
     import re
 
+    # Replace hyphens in identifiers with underscores (e.g., ATmega328P-AU -> ATmega328P_AU).
+    # Only matches a single hyphen between word characters; `--` in connect statements has
+    # spaces around it and is never touched.
+    content = re.sub(r'(?<=\w)-(?=\w)', '_', content)
+
     # Replace # in pin names with _N (e.g., HOLD# -> HOLD_N, RESET# -> RESET_N)
     content = re.sub(r'(\b\w+)#', r'\1_N', content)
+
+    # Fix bare "R" resistance suffix -> "ohm" (e.g., 220R -> 220ohm, 4.7kR -> 4.7kohm)
+    content = re.sub(r'(\d)R\b', r'\1ohm', content)
+    content = re.sub(r'(\d[kKmM])R\b', r'\1ohm', content)
 
     # Fix D+ -> DP and D- -> DN (common USB pin names with invalid chars)
     content = re.sub(r'\bD\+', 'DP', content)

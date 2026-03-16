@@ -9,7 +9,7 @@ BACKEND = "ollama"
 # -- Ollama ------------------------------------------------------------------
 
 OLLAMA_URL = "http://10.0.0.10:11434"
-OLLAMA_MODEL = "qwen3:14b"
+OLLAMA_MODEL = "qwen3:8b"
 OLLAMA_TIMEOUT = 600  # seconds per LLM call
 OLLAMA_NUM_CTX = 16384  # context window (tokens)
 
