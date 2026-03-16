@@ -671,17 +671,23 @@ def get_part_datasheet(url: str) -> str:
 
 @_register("list_stdlib")
 def list_stdlib() -> str:
-    stdlib = config.STDLIB_PATH
+    """List all .decl files in the stdlib, including in subfolders (e.g. components/agent)."""
+    stdlib = Path(config.STDLIB_PATH)
     result: dict[str, list[str]] = {}
     if not stdlib.is_dir():
         return json.dumps({"error": f"stdlib not found at {stdlib}"})
 
-    for subdir in sorted(stdlib.iterdir()):
-        if subdir.is_dir():
-            files = sorted(f.name for f in subdir.glob("*.decl"))
-            if files:
-                result[subdir.name] = files
-    return json.dumps(result, indent=2)
+    for path in sorted(stdlib.rglob("*.decl")):
+        rel = path.relative_to(stdlib)
+        parent_key = str(rel.parent).replace("\\", "/")
+        if parent_key == ".":
+            parent_key = ""
+        if parent_key not in result:
+            result[parent_key] = []
+        result[parent_key].append(rel.name)
+    for key in result:
+        result[key] = sorted(result[key])
+    return json.dumps(dict(sorted(result.items())), indent=2)
 
 
 @_register("read_stdlib_file")

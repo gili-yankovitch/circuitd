@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 _DECL_FENCE_RE = re.compile(r"```(?:decl)?\s*\n(.*?)```", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+_FIRST_COMPONENT_RE = re.compile(r"\bcomponent\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.MULTILINE)
 
 # Tools for Phase 2 only (parts discovery + save datasheet-derived DECL to stdlib)
 PARTS_PHASE_TOOL_NAMES = (
@@ -39,7 +40,13 @@ PARTS_PHASE_TOOL_NAMES = (
 PARTS_PHASE_TOOLS = [t for t in TOOL_DEFINITIONS if t["function"]["name"] in PARTS_PHASE_TOOL_NAMES]
 PARTS_PHASE_DISPATCH = {k: v for k, v in TOOL_DISPATCH.items() if k in PARTS_PHASE_TOOL_NAMES}
 
-_DATASHEET_TO_DECL_MAX_ATTEMPTS = 5
+_DATASHEET_TO_DECL_MAX_ATTEMPTS = 20
+
+
+def _first_component_name_from_decl(decl: str) -> str | None:
+    """Return the name of the first component defined in decl, or None."""
+    m = _FIRST_COMPONENT_RE.search(decl)
+    return m.group(1) if m else None
 
 
 def _convert_datasheet_to_decl_and_save(
@@ -54,7 +61,7 @@ def _convert_datasheet_to_decl_and_save(
         logger.debug("Datasheet text too short to convert")
         return
     short_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
-    save_path = f"components/agent/datasheet_{short_hash}.decl"
+    fallback_path = f"components/agent/datasheet_{short_hash}.decl"
     prompt_prefix = (
         "Convert this datasheet excerpt to a single DECL component (and optional variants). "
         "Output ONLY a ```decl block.\n\n" + datasheet_text[:8000]
@@ -90,6 +97,12 @@ def _convert_datasheet_to_decl_and_save(
                     logger.warning("Datasheet-to-DECL: gave up after %d attempts (validation failed)", _DATASHEET_TO_DECL_MAX_ATTEMPTS)
                     return
                 continue
+            # Name file after the main component (first component in decl)
+            main_name = _first_component_name_from_decl(decl)
+            if main_name:
+                save_path = f"components/agent/{main_name}.decl"
+            else:
+                save_path = fallback_path
             result = save_to_stdlib(save_path, decl)
             out = json.loads(result) if result.strip().startswith("{") else {}
             if out.get("ok"):
