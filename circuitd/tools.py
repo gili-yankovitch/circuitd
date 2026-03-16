@@ -20,6 +20,50 @@ _VALIDATION_ERROR_RE = re.compile(
 )
 _ERROR_CODE_RE = re.compile(r"\b(E00[1-9]|E010)\b")
 
+# Import line: import "path" (path may be relative)
+_IMPORT_LINE_RE = re.compile(r'^\s*import\s+"([^"]+)"\s*$')
+
+
+def _expand_decl_imports(
+    content: str,
+    base_path: Path,
+    visited: set[Path] | None = None,
+) -> str:
+    """Resolve `import "path"` lines by reading and inlining imported files.
+
+    Paths are resolved relative to base_path (the directory of the current file).
+    Circular imports and repeated imports are skipped (each file inlined at most once).
+    Returns content with import lines replaced by the expanded content of the imported file.
+    """
+    if visited is None:
+        visited = set()
+    base_path = base_path.resolve()
+    if not base_path.is_dir():
+        return content
+    out_lines: list[str] = []
+    for line in content.splitlines():
+        match = _IMPORT_LINE_RE.match(line)
+        if match:
+            path_str = match.group(1).strip().replace("\\", "/")
+            resolved = (base_path / path_str).resolve()
+            if resolved in visited:
+                continue
+            if not resolved.is_file():
+                out_lines.append(line)
+                continue
+            visited.add(resolved)
+            try:
+                sub_content = resolved.read_text()
+            except OSError:
+                out_lines.append(line)
+                continue
+            expanded_sub = _expand_decl_imports(sub_content, resolved.parent, visited)
+            out_lines.append(expanded_sub)
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 # ---------------------------------------------------------------------------
 # Ollama tool-calling schema definitions
 # ---------------------------------------------------------------------------
@@ -88,6 +132,7 @@ TOOL_DEFINITIONS: list[dict] = [
             "name": "read_stdlib_file",
             "description": (
                 "Read the full content of a DECL standard library file. "
+                "Imports (import \"path\") are resolved and inlined so you get the complete expanded content. "
                 "Pass a relative path like 'components/resistor.decl' or 'protocols/spi.decl'."
             ),
             "parameters": {
@@ -245,11 +290,14 @@ def list_stdlib() -> str:
 
 @_register("read_stdlib_file")
 def read_stdlib_file(path: str) -> str:
-    target = config.STDLIB_PATH / path
+    normalized = path.strip().replace("\\", "/").lstrip("/")
+    target = config.STDLIB_PATH / normalized
     if not target.is_file():
         return json.dumps({"error": f"File not found: {path}"})
     try:
-        return target.read_text()
+        content = target.read_text()
+        content = _expand_decl_imports(content, target.parent)
+        return content
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
@@ -267,7 +315,7 @@ def save_to_stdlib(path: str, content: str) -> str:
         })
     target = config.STDLIB_PATH / normalized
     fixed = _fix_common_issues(content)
-    _, structured = validate_decl_structured(fixed)
+    _, structured = validate_decl_structured(fixed, base_path=target.parent)
     if structured:
         return json.dumps({
             "error": "DECL validation failed; fix before saving",
@@ -390,9 +438,16 @@ def _parse_validation_errors(raw_output: str) -> list[dict]:
     return structured
 
 
-def _run_decl_check(content: str) -> tuple[str, str, bool]:
-    """Run decl checker on content. Returns (stdout, stderr, success)."""
+def _run_decl_check(content: str, base_path: Path | None = None) -> tuple[str, str, bool]:
+    """Run decl checker on content. Returns (stdout, stderr, success).
+
+    If content contains import statements, they are resolved relative to base_path
+    (default: config.STDLIB_PATH) so the checker sees a single expanded file.
+    """
     content = _fix_common_issues(content)
+    expand_base = base_path if base_path is not None else getattr(config, "STDLIB_PATH", None)
+    if "import " in content and expand_base is not None and Path(expand_base).is_dir():
+        content = _expand_decl_imports(content, Path(expand_base))
     with tempfile.NamedTemporaryFile(mode="w", suffix=".decl", delete=False) as f:
         f.write(content)
         tmp_path = f.name
@@ -415,14 +470,17 @@ def _run_decl_check(content: str) -> tuple[str, str, bool]:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-def validate_decl_structured(content: str) -> tuple[str, list[dict]]:
+def validate_decl_structured(content: str, base_path: Path | None = None) -> tuple[str, list[dict]]:
     """Validate .decl content; return (human-readable output, structured errors).
 
     Structured errors are list of {"code", "line", "message", "entities"} for use
     in the repair phase. If the checker output is not parseable, structured_errors
     is empty but human_output is still returned.
+
+    If content contains import statements, base_path is used to resolve them
+    (default: config.STDLIB_PATH).
     """
-    stdout, stderr, is_ok = _run_decl_check(content)
+    stdout, stderr, is_ok = _run_decl_check(content, base_path=base_path)
     output = ""
     if stdout:
         output += stdout
