@@ -1,0 +1,42 @@
+W25Q128JV - 3V 128M-BIT SERIAL FLASH MEMORY WITH DUAL/QUAD SPI
+Winbond
+Publication Release Date: March 27, 2018  Revision F
+
+1. GENERAL DESCRIPTIONS
+The W25Q128JV (128M-bit) Serial Flash memory provides a storage solution for systems with limited space, pins and power. The 25Q series offers flexibility and performance well beyond ordinary Serial Flash devices. They are ideal for code shadowing to RAM, executing code directly from Dual/Quad SPI (XIP) and storing voice, text and data. The device operates on a single 2.7V to 3.6V power supply with current consumption as low as 1μA for power-down. All devices are offered in space-saving packages.
+
+The W25Q128JV array is organized into 65,536 programmable pages of 256-bytes each. Up to 256 bytes can be programmed at a time. Pages can be erased in groups of 16 (4KB sector erase), groups of 128 (32KB block erase), groups of 256 (64KB block erase) or the entire chip (chip erase). The W25Q128JV has 4,096 erasable sectors and 256 erasable blocks respectively.
+
+2. FEATURES
+- W25Q128JV: 128M-bit / 16M-byte
+- Standard SPI: CLK, /CS, DI, DO
+- Dual SPI: CLK, /CS, IO₀, IO₁
+- Quad SPI: CLK, /CS, IO₀, IO₁, IO₂, IO₃
+- Software & Hardware Reset
+- 133MHz Single, Dual/Quad SPI clocks
+- Single 2.7 to 3.6V supply
+- -40°C to +85°C operating range
+
+3. PIN DESCRIPTIONS - SOIC 208-mil, WSON 6x5-mm / 8x6-mm
+PAD NO.  PAD NAME              I/O    FUNCTION
+1        /CS                   I      Chip Select Input
+2        DO (IO1)              I/O    Data Output (Data Input Output 1)
+3        /WP (IO2)             I/O    Write Protect Input (Data Input Output 2)
+4        GND                   -      Ground
+5        DI (IO0)              I/O    Data Input (Data Input Output 0)
+6        CLK                   I      Serial Clock Input
+7        /HOLD or /RESET (IO3)  I/O    Hold or Reset Input (Data Input Output 3)
+8        VCC                   -      Power Supply
+
+4. PIN DESCRIPTIONS (detailed)
+Chip Select (/CS): The SPI Chip Select (/CS) pin enables and disables device operation.
+Serial Data Input, Output and IOs (DI, DO and IO0, IO1, IO2, IO3): Standard SPI uses DI and DO; Dual/Quad use IO pins.
+Write Protect (/WP): Active low, prevents Status Register writes.
+HOLD (/HOLD): Allows the device to be paused while selected. Active low.
+Serial Clock (CLK): Timing for serial input and output.
+Reset (/RESET): Dedicated hardware reset on SOIC-16 and TFBGA. Drive low for min ~1μs to reset.
+
+9. ELECTRICAL CHARACTERISTICS
+Supply Voltage VCC: 2.7V to 3.6V (operating)
+Standby Current ICC1: 10 μA typ, 60 μA max
+Power-down Current ICC2: 1 μA typ, 20 μA max
