@@ -239,6 +239,11 @@ HARD INVARIANTS:
 10. Preserve exact named parts from the plan.
 11. All names (component, protocol, schematic, variant, instance, net) must start with an alphabetic letter; they must NOT start with a digit.
 
+IMPORTS (MANDATORY):
+- USE IMPORTS instead of inlining. Do NOT paste full protocol or component definitions from stdlib into the output.
+- At the top of the file, add import "path" for every protocol and component you use that exists in stdlib (e.g. import "protocols/spi.decl", import "protocols/i2c.decl", import "protocols/uart.decl", import "components/Resistor.decl", import "components/agent/W25Q128JV.decl").
+- Only define (inline) components or protocols that are NOT already in stdlib. Prefer list_stdlib / read_stdlib_file to see what exists; then import those and emit only the schematic (and any custom component not in stdlib).
+
 GENERATION POLICY:
 - Prefer generic reusable components for passives unless a specific part is in the plan.
 - Keep protocols/components/variants only if they are actually used.
@@ -268,6 +273,7 @@ Return ONLY one ```decl block.
 Rules:
 - Fix only what is required by the validator errors, unless another fix is needed to resolve them.
 - Preserve valid existing structure and names when possible.
+- Prefer using import "path" for protocols and stdlib components instead of inlining their definitions; if the file inlines protocols/components that exist in stdlib, refactor to use imports at the top and remove the inline definitions.
 - Do not introduce new features or components unless needed to resolve an error.
 - Pay special attention to:
   - identifiers that start with a digit (must start with an alphabetic letter)
@@ -292,14 +298,21 @@ From the datasheet text below, extract the part name, all pins (with correct dir
 
 Output:
 Return ONLY one ```decl block containing:
-1. One component definition (name = part number or logical name, e.g. W25Q128JV or AMS1117_3V3).
-2. Optionally one or more variant blocks if the datasheet describes package-specific pinouts.
+1. Imports for any protocols the part uses: import "protocols/spi.decl", import "protocols/i2c.decl", import "protocols/uart.decl" as needed. Do NOT inline protocol definitions.
+2. One component definition (name = part number or logical name, e.g. W25Q128JV or AMS1117_3V3).
+3. If the component uses SPI, I2C, UART (or similar), you MUST declare them in the component block and assign pins:
+   - Add a features { } block with external name using protocol PROTO role ROLE { LINE -> pin PIN ... } for each interface.
+   - SPI: use protocol SPI, role slave for memories/sensors (role master for controllers). Map: MOSI -> pin DI (or your data-in pin), MISO -> pin DO (or data-out), CLK -> pin CLK/SCK, SS -> pin CS/NSS.
+   - I2C: use protocol I2C, role slave or master. Map: SDA -> pin SDA, SCL -> pin SCL (or datasheet names).
+   - UART: use protocol UART. Map: TX -> pin TX/TXD, RX -> pin RX/RXD.
+4. Optionally one or more variant blocks if the datasheet describes package-specific pinouts.
 
 Rules:
 - Component and variant names MUST start with an alphabetic letter (e.g. use C_74HC595 or U_74HC595, not 74HC595).
 - Pin names: only letters, digits, underscores (use HOLD_N not HOLD#, DP/DN not D+/D-).
 - Numbered pins: use "N: PinType as ALIAS" (e.g. 1: PowerInput as VCC).
 - No commas, no semicolons. No prose outside the block.
+- USE IMPORTS for protocols; never paste protocol definitions inline.
 """
 
 # ---------------------------------------------------------------------------
@@ -662,7 +675,7 @@ schematic MyBoard {
 
 ## Rules
 
-- The .decl file MUST be self-contained (define all protocols/components inline).
+- USE IMPORTS: Do not inline protocol or component definitions from stdlib. Start the file with import "protocols/spi.decl" (and i2c, uart, etc. as needed) and import "components/..." for components you use; only define components that are not in stdlib.
 - Every IC needs 100nF bypass caps. LDO needs input+output caps (10uF typical).
 - LED needs a current-limiting resistor: R = (Vsupply - Vf) / If
 - Reset buttons need a pull-up resistor to VCC (10kohm typical).
