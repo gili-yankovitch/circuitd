@@ -24,6 +24,7 @@ from .tools import (
     validate_decl_structured,
     _fix_common_issues,
     save_to_stdlib,
+    get_stdlib_component_decl,
 )
 
 logger = logging.getLogger(__name__)
@@ -371,6 +372,19 @@ def _run_phase4_generate_decl(
         "Emit only a ```decl code block containing the complete .decl file for this plan:\n\n"
         + json.dumps(design_plan, indent=2)
     )
+    # Include stdlib component definitions so the LLM uses correct protocol pin mappings (e.g. SPI CLK/MOSI/MISO/SS)
+    comp_types = set()
+    for inst in design_plan.get("instances", []):
+        c = inst.get("component")
+        if isinstance(c, str):
+            comp_types.add(c)
+    stdlib_refs: list[str] = []
+    for comp_name in sorted(comp_types):
+        decl_content = get_stdlib_component_decl(comp_name)
+        if decl_content:
+            stdlib_refs.append(f"\n--- stdlib reference for {comp_name} (use these pins for protocol connections) ---\n{decl_content[:12000]}")
+    if stdlib_refs:
+        user_msg += "\n\nReference definitions from stdlib (protocol pin mappings must be respected):" + "\n".join(stdlib_refs)
     response = chat.send(user_msg)
     decl = _extract_decl(response)
     if decl:

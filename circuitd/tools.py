@@ -23,6 +23,402 @@ _ERROR_CODE_RE = re.compile(r"\b(E00[1-9]|E010)\b")
 # Import line: import "path" (path may be relative)
 _IMPORT_LINE_RE = re.compile(r'^\s*import\s+"([^"]+)"\s*$')
 
+# Protocol-pin validation: extract protocols, external features, and connections from DECL text
+_LINE_TO_PIN_RE = re.compile(r"(\w+)\s*->\s*pin\s+(\w+)")
+_VARIANT_OF_RE = re.compile(r"variant\s+(\w+)\s+of\s+(\w+)")
+_INSTANCE_RE = re.compile(r"instance\s+(\w+)\s*:\s*(\w+)")
+_CONNECT_RE = re.compile(
+    r"connect\s+(\w+)\.(\w+)\s+--\s+(?:net\s+(\w+)|(\w+)\.(\w+))"
+)
+# Protocol: rules block "role1.LINE1 -- role2.LINE2"
+_WIRING_RULE_RE = re.compile(r"(\w+)\.(\w+)\s*--\s*(\w+)\.(\w+)")
+# External feature: any protocol and role
+_EXTERNAL_FEATURE_RE = re.compile(
+    r"external\s+\w+\s+using\s+protocol\s+(\w+)\s+role\s+(\w+)\s*\{([^}]+)\}",
+    re.DOTALL,
+)
+
+# Fallback when one side has no protocol feature: treat these pin names as protocol line aliases (e.g. flash DI/DO/CS)
+_PROTOCOL_LINE_ALIASES: dict[str, str] = {"DI": "MOSI", "DO": "MISO", "CS": "SS"}
+
+
+def _extract_line_to_pin_from_block(block: str) -> dict[str, str]:
+    """Parse 'CLK -> pin PC5  MOSI -> pin PC6' into { CLK: PC5, MOSI: PC6 }."""
+    out: dict[str, str] = {}
+    for m in _LINE_TO_PIN_RE.finditer(block):
+        line_name, pin_name = m.group(1), m.group(2)
+        out[line_name.upper()] = pin_name
+    return out
+
+
+def _extract_protocols_from_decl(decl: str) -> dict[str, tuple[frozenset[tuple[str, str, str, str]], frozenset[str]]]:
+    """Extract protocol name -> (rules_set, line_names). rules_set = (role_a, line_a, role_b, line_b)."""
+    result: dict[str, tuple[set[tuple[str, str, str, str]], set[str]]] = {}
+    proto_block_re = re.compile(r"protocol\s+(\w+)\s*\{", re.MULTILINE)
+    pos = 0
+    while True:
+        m = proto_block_re.search(decl, pos)
+        if not m:
+            break
+        proto_name = m.group(1)
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(decl) and depth > 0:
+            if decl[i] == "{":
+                depth += 1
+            elif decl[i] == "}":
+                depth -= 1
+            i += 1
+        block = decl[start : i - 1]
+        rules_set: set[tuple[str, str, str, str]] = set()
+        line_names: set[str] = set()
+        rules_m = re.search(r"rules\s*\{([^}]+)\}", block, re.DOTALL)
+        if rules_m:
+            for w in _WIRING_RULE_RE.finditer(rules_m.group(1)):
+                r1, l1, r2, l2 = w.group(1), w.group(2).upper(), w.group(3), w.group(4).upper()
+                rules_set.add((r1, l1, r2, l2))
+                line_names.add(l1)
+                line_names.add(l2)
+        result[proto_name] = (frozenset(rules_set), frozenset(line_names))
+        pos = i
+    return {k: (v[0], v[1]) for k, v in result.items()}
+
+
+def _extract_component_features_and_variants(
+    decl: str,
+) -> tuple[dict[str, list[dict]], dict[str, str]]:
+    """Extract component name -> list of {protocol, role, line_to_pin}, and variant -> base."""
+    comp_features: dict[str, list[dict]] = {}
+    variant_base: dict[str, str] = {}
+    comp_block_re = re.compile(r"component\s+(\w+)\s*\{", re.MULTILINE)
+    pos = 0
+    while True:
+        m = comp_block_re.search(decl, pos)
+        if not m:
+            break
+        comp_name = m.group(1)
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(decl) and depth > 0:
+            if decl[i] == "{":
+                depth += 1
+            elif decl[i] == "}":
+                depth -= 1
+            i += 1
+        block = decl[start : i - 1]
+        for ext in _EXTERNAL_FEATURE_RE.finditer(block):
+            proto, role = ext.group(1), ext.group(2)
+            line_to_pin = _extract_line_to_pin_from_block(ext.group(3))
+            if line_to_pin:
+                comp_features.setdefault(comp_name, []).append({
+                    "protocol": proto,
+                    "role": role,
+                    "line_to_pin": line_to_pin,
+                })
+        pos = i
+    for m in _VARIANT_OF_RE.finditer(decl):
+        variant_base[m.group(1)] = m.group(2)
+    return comp_features, variant_base
+
+
+def _load_stdlib_protocols_and_features_for_component(
+    component_name: str,
+) -> tuple[dict[str, list[dict]], dict[str, str], dict[str, tuple[frozenset[tuple[str, str, str, str]], frozenset[str]]]]:
+    """Load from stdlib: comp_features, variant_base, and protocols for this component's file."""
+    stdlib = getattr(config, "STDLIB_PATH", None)
+    if not stdlib or not Path(stdlib).is_dir():
+        return {}, {}, {}
+    comp_features: dict[str, list[dict]] = {}
+    variant_base: dict[str, str] = {}
+    protocols: dict[str, tuple[frozenset[tuple[str, str, str, str]], frozenset[str]]] = {}
+    comp_or_variant_re = re.compile(
+        rf"(?:component|variant)\s+{re.escape(component_name)}\s+(?:\{{|of\s+)",
+        re.MULTILINE,
+    )
+    for path in Path(stdlib).rglob("*.decl"):
+        try:
+            content = path.read_text()
+        except OSError:
+            continue
+        if not comp_or_variant_re.search(content):
+            continue
+        content = _expand_decl_imports(content, path.parent)
+        protocols.update(_extract_protocols_from_decl(content))
+        c_f, v_b = _extract_component_features_and_variants(content)
+        comp_features.update(c_f)
+        variant_base.update(v_b)
+        break
+    return comp_features, variant_base, protocols
+
+
+def get_stdlib_component_decl(component_name: str) -> str | None:
+    """Return expanded DECL content of the stdlib file that defines this component or variant."""
+    stdlib = getattr(config, "STDLIB_PATH", None)
+    if not stdlib or not Path(stdlib).is_dir():
+        return None
+    comp_or_variant_re = re.compile(
+        rf"(?:component|variant)\s+{re.escape(component_name)}\s+(?:\{{|of\s+)",
+        re.MULTILINE,
+    )
+    for path in Path(stdlib).rglob("*.decl"):
+        try:
+            content = path.read_text()
+        except OSError:
+            continue
+        if comp_or_variant_re.search(content):
+            return _expand_decl_imports(content, path.parent)
+    return None
+
+
+def _extract_instances_and_connections(decl: str) -> tuple[dict[str, str], list[tuple[str, str, str, str]]]:
+    """Return (inst_name -> component_type, list of (inst1, pin1, inst2, pin2))."""
+    instances: dict[str, str] = {}
+    for m in _INSTANCE_RE.finditer(decl):
+        instances[m.group(1)] = m.group(2)
+    pairs: list[tuple[str, str, str, str]] = []
+    nets: dict[str, set[tuple[str, str]]] = {}
+    for m in _CONNECT_RE.finditer(decl):
+        inst1, pin1 = m.group(1), m.group(2)
+        net_name = m.group(3)
+        inst2, pin2 = m.group(4), m.group(5)
+        if inst2 and pin2:
+            pairs.append((inst1, pin1, inst2, pin2))
+        elif net_name:
+            nets.setdefault(net_name, set()).add((inst1, pin1))
+    for endpoints in nets.values():
+        el = list(endpoints)
+        for i in range(len(el)):
+            for j in range(i + 1, len(el)):
+                pairs.append((el[i][0], el[i][1], el[j][0], el[j][1]))
+    return instances, pairs
+
+
+def _line_for_pin(pin: str, line_to_pin: dict[str, str]) -> str | None:
+    """Return protocol line name if pin is in line_to_pin mapping."""
+    pin_upper = pin.upper()
+    for line, p in line_to_pin.items():
+        if p.upper() == pin_upper:
+            return line.upper()
+    return None
+
+
+def _pin_alias_to_line(pin_or_line: str, protocol_lines: frozenset[str]) -> str | None:
+    """Map pin/line name to protocol line (e.g. DI->MOSI). Returns None if not a known line or alias."""
+    u = pin_or_line.upper()
+    if u in protocol_lines:
+        return u
+    return _PROTOCOL_LINE_ALIASES.get(u)
+
+
+def _rules_allow_connection(
+    proto_name: str,
+    role1: str,
+    line1: str,
+    role2: str,
+    line2: str,
+    protocols: dict[str, tuple[frozenset[tuple[str, str, str, str]], frozenset[str]]],
+) -> bool:
+    """True if protocol rules say role1.line1 connects to role2.line2."""
+    entry = protocols.get(proto_name)
+    if not entry:
+        return False
+    rules, _ = entry
+    return (role1, line1, role2, line2) in rules or (role2, line2, role1, line1) in rules
+
+
+def validate_decl_protocol_pins(decl_content: str) -> list[dict]:
+    """Check that protocol pins are connected according to the protocol rules from the DECL.
+
+    Uses protocol definitions (rules { role1.L1 -- role2.L2 }) and component external
+    features (external X using protocol P role R { L -> pin PIN }) from the decl and stdlib.
+    Returns structured errors (code E011) for repair.
+    """
+    errors: list[dict] = []
+    decl = _fix_common_issues(decl_content)
+    protocols = _extract_protocols_from_decl(decl)
+    comp_features, variant_base = _extract_component_features_and_variants(decl)
+    instances, pairs = _extract_instances_and_connections(decl)
+    stdlib_path = getattr(config, "STDLIB_PATH", None)
+
+    def get_features(inst_name: str) -> list[dict]:
+        comp_type = instances.get(inst_name)
+        if not comp_type:
+            return []
+        base = variant_base.get(comp_type) or comp_type
+        feats = comp_features.get(base) or comp_features.get(comp_type)
+        if feats:
+            return feats
+        if stdlib_path:
+            s_feat, s_var, s_proto = _load_stdlib_protocols_and_features_for_component(comp_type)
+            protocols.update(s_proto)
+            b = s_var.get(comp_type) or comp_type
+            feats = s_feat.get(b) or s_feat.get(comp_type)
+            if feats:
+                return feats
+        return []
+
+    for (inst1, pin1, inst2, pin2) in pairs:
+        feats1 = get_features(inst1)
+        feats2 = get_features(inst2)
+        if not feats1 and not feats2:
+            continue
+
+        # Resolve pin to (protocol, role, line) for each side
+        def resolve_pin(feats: list[dict], pin: str) -> list[tuple[str, str, str, dict[str, str]]]:
+            out = []
+            for f in feats:
+                line = _line_for_pin(pin, f["line_to_pin"])
+                if line is not None:
+                    out.append((f["protocol"], f["role"], line, f["line_to_pin"]))
+            return out
+
+        r1 = resolve_pin(feats1, pin1)
+        r2 = resolve_pin(feats2, pin2)
+
+        # Both sides have a protocol mapping for this pin: validate with protocol rules
+        if r1 and r2:
+            for (p1, role1, line1, _) in r1:
+                for (p2, role2, line2, _) in r2:
+                    if p1 != p2:
+                        continue
+                    if p1 not in protocols:
+                        continue
+                    if not _rules_allow_connection(p1, role1, line1, role2, line2, protocols):
+                        errors.append({
+                            "code": "E011",
+                            "line": 0,
+                            "message": (
+                                f"Protocol pin mismatch: {inst1}.{pin1} ({p1} {role1}.{line1}) connected to "
+                                f"{inst2}.{pin2} ({p2} {role2}.{line2}). Connection is not allowed by protocol {p1} rules."
+                            ),
+                            "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                        })
+            continue
+
+        # One side has mapping, other does not: fallback using line aliases (e.g. flash DI/DO/CS)
+        pin2_line = pin2.upper()
+        pin1_line = pin1.upper()
+        for (proto_name, role1, line1, line_to_pin1) in r1:
+            entry = protocols.get(proto_name)
+            proto_lines = entry[1] if entry else frozenset()
+            other_line = _pin_alias_to_line(pin2_line, proto_lines) or (pin2_line if pin2_line in proto_lines else None)
+            if other_line and other_line != line1:
+                errors.append({
+                    "code": "E011",
+                    "line": 0,
+                    "message": (
+                        f"Protocol pin mismatch: {inst1}.{pin1} is {proto_name} {line1} but connected to {inst2}.{pin2}. "
+                        f"{proto_name} {line1} should connect to the matching line on the other device."
+                    ),
+                    "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                })
+            elif not other_line and pin2_line in (proto_lines | frozenset(_PROTOCOL_LINE_ALIASES.keys())):
+                other_line = _pin_alias_to_line(pin2_line, proto_lines) or pin2_line
+                if other_line != line1:
+                    errors.append({
+                        "code": "E011",
+                        "line": 0,
+                        "message": (
+                            f"Protocol pin mismatch: {inst1}.{pin1} is {proto_name} {line1} but connected to {inst2}.{pin2}. "
+                            f"Expected matching {proto_name} line (e.g. {line1}–{line1})."
+                        ),
+                        "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                    })
+            # Mapped side using wrong physical pin for this line
+            expected_pin = line_to_pin1.get(line1)
+            if expected_pin and expected_pin.upper() != pin1.upper() and other_line == line1:
+                errors.append({
+                    "code": "E011",
+                    "line": 0,
+                    "message": (
+                        f"Wrong pin on {inst1}: {inst2}.{pin2} ({proto_name} {line1}) is connected to {inst1}.{pin1}, "
+                        f"but {inst1} should use {expected_pin} for {proto_name} {line1} (see protocol pin mapping)."
+                    ),
+                    "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                })
+            break
+
+        for (proto_name, role2, line2, line_to_pin2) in r2:
+            entry = protocols.get(proto_name)
+            proto_lines = entry[1] if entry else frozenset()
+            other_line = _pin_alias_to_line(pin1_line, proto_lines) or (pin1_line if pin1_line in proto_lines else None)
+            if other_line and other_line != line2:
+                errors.append({
+                    "code": "E011",
+                    "line": 0,
+                    "message": (
+                        f"Protocol pin mismatch: {inst2}.{pin2} is {proto_name} {line2} but connected to {inst1}.{pin1}. "
+                        f"{proto_name} {line2} should connect to the matching line on the other device."
+                    ),
+                    "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                })
+            elif not other_line and pin1_line in (proto_lines | frozenset(_PROTOCOL_LINE_ALIASES.keys())):
+                other_line = _pin_alias_to_line(pin1_line, proto_lines) or pin1_line
+                if other_line != line2:
+                    errors.append({
+                        "code": "E011",
+                        "line": 0,
+                        "message": (
+                            f"Protocol pin mismatch: {inst2}.{pin2} is {proto_name} {line2} but connected to {inst1}.{pin1}. "
+                            f"Use the correct {proto_name} pin for {inst1} (check protocol pin mapping)."
+                        ),
+                        "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                    })
+            expected_pin = line_to_pin2.get(line2)
+            if expected_pin and expected_pin.upper() != pin2.upper() and other_line == line2:
+                errors.append({
+                    "code": "E011",
+                    "line": 0,
+                    "message": (
+                        f"Wrong pin on {inst2}: {inst1}.{pin1} ({proto_name} {line2}) is connected to {inst2}.{pin2}, "
+                        f"but {inst2} should use {expected_pin} for {proto_name} {line2}."
+                    ),
+                    "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                })
+            break
+
+        # One side has features but neither pin is in a mapping: check "wrong physical pin" (e.g. PA5 vs PC5 for CLK)
+        if not r1 and feats1 and pin2_line in frozenset(_PROTOCOL_LINE_ALIASES.keys()) | frozenset(("CLK", "MOSI", "MISO", "SS")):
+            for f in feats1:
+                proto_name = f["protocol"]
+                entry = protocols.get(proto_name)
+                proto_lines = entry[1] if entry else frozenset()
+                canonical = _pin_alias_to_line(pin2_line, proto_lines) or pin2_line
+                expected_pin = f["line_to_pin"].get(canonical)
+                if expected_pin and expected_pin.upper() != pin1.upper():
+                    errors.append({
+                        "code": "E011",
+                        "line": 0,
+                        "message": (
+                            f"Wrong pin on {inst1}: {inst2}.{pin2} ({proto_name} {canonical}) is connected to {inst1}.{pin1}, "
+                            f"but {inst1} should use {expected_pin} for {proto_name} {canonical} (see protocol pin mapping)."
+                        ),
+                        "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                    })
+                    break
+        if not r2 and feats2 and pin1_line in frozenset(_PROTOCOL_LINE_ALIASES.keys()) | frozenset(("CLK", "MOSI", "MISO", "SS")):
+            for f in feats2:
+                proto_name = f["protocol"]
+                entry = protocols.get(proto_name)
+                proto_lines = entry[1] if entry else frozenset()
+                canonical = _pin_alias_to_line(pin1_line, proto_lines) or pin1_line
+                expected_pin = f["line_to_pin"].get(canonical)
+                if expected_pin and expected_pin.upper() != pin2.upper():
+                    errors.append({
+                        "code": "E011",
+                        "line": 0,
+                        "message": (
+                            f"Wrong pin on {inst2}: {inst1}.{pin1} ({proto_name} {canonical}) is connected to {inst2}.{pin2}, "
+                            f"but {inst2} should use {expected_pin} for {proto_name} {canonical}."
+                        ),
+                        "entities": [f"{inst1}.{pin1}", f"{inst2}.{pin2}"],
+                    })
+                    break
+
+    return errors
+
 
 def _expand_decl_imports(
     content: str,
@@ -490,7 +886,13 @@ def validate_decl_structured(content: str, base_path: Path | None = None) -> tup
         output = "(no output)"
     output = _annotate_errors(output, _fix_common_issues(content))
     structured = [] if is_ok else _parse_validation_errors(stdout + "\n" + stderr)
-    if is_ok:
+    protocol_errors = validate_decl_protocol_pins(content)
+    if protocol_errors:
+        structured = structured + protocol_errors
+        output += "\n\nProtocol pin validation failed:\n" + "\n".join(
+            e.get("message", "") for e in protocol_errors
+        )
+    if is_ok and not protocol_errors:
         output += (
             "\n\nVALIDATION PASSED. W001 (unconnected pin) warnings are expected "
             "for unused MCU pins and can be ignored. Do NOT re-validate. "
