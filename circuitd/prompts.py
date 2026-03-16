@@ -309,7 +309,7 @@ Return ONLY one ```decl block containing:
 
 Rules:
 - Component and variant names MUST start with an alphabetic letter (e.g. use C_74HC595 or U_74HC595, not 74HC595).
-- Pin names: only letters, digits, underscores (use HOLD_N not HOLD#, DP/DN not D+/D-).
+- Pin names: MUST START WITH AN ALPHABETIC LETTER ONLY; they must NOT start with a digit. They can contain only letters, digits, underscores (use HOLD_N not HOLD#, DP/DN not D+/D-).
 - Numbered pins: use "N: PinType as ALIAS" (e.g. 1: PowerInput as VCC).
 - No commas, no semicolons. No prose outside the block.
 - USE IMPORTS for protocols; never paste protocol definitions inline.

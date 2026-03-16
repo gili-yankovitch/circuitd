@@ -52,8 +52,8 @@ class TestPartsDispatchWithAutoSave:
         fake_dispatch = dict(PARTS_PHASE_DISPATCH)
         fake_dispatch["get_part_datasheet"] = lambda url: success_result
         with patch.object(agent, "PARTS_PHASE_DISPATCH", fake_dispatch):
-            with patch("circuitd.agent.create_chat") as mock_create_chat:
-                with patch("circuitd.agent.validate_decl_structured", return_value=("OK: file", [])):
+            with patch("circuitd.datasheet_to_decl.create_chat") as mock_create_chat:
+                with patch("circuitd.datasheet_to_decl.validate_decl_structured", return_value=("OK: file", [])):
                     with patch("circuitd.agent.save_to_stdlib", MagicMock(return_value='{"ok": true}')) as mock_save:
                         with patch("circuitd.tools.config.STDLIB_PATH", mock_stdlib_path), \
                              patch("circuitd.tools.config.STDLIB_AGENT_SUBDIR", "components/agent"):
@@ -104,7 +104,7 @@ class TestConvertDatasheetToDeclAndSave:
         ("x" * 100, False),
     ])
     def test_skips_when_text_too_short(self, text, should_skip):
-        with patch("circuitd.agent.create_chat"), patch("circuitd.agent.save_to_stdlib", MagicMock()) as mock_save:
+        with patch("circuitd.datasheet_to_decl.create_chat"), patch("circuitd.agent.save_to_stdlib", MagicMock()) as mock_save:
             _convert_datasheet_to_decl_and_save(
                 text, "https://x.com/d.pdf",
                 backend="ollama", model=None, ollama_url=None,
@@ -118,8 +118,8 @@ class TestConvertDatasheetToDeclAndSave:
     def test_calls_save_when_llm_returns_valid_decl_and_validation_passes(self, mock_stdlib_path):
         """With real W25Q128JV datasheet text, LLM returns valid DECL and validation passes -> save_to_stdlib called."""
         datasheet_text = _load_w25q128jv_excerpt()
-        with patch("circuitd.agent.create_chat") as mock_create_chat:
-            with patch("circuitd.agent.validate_decl_structured", return_value=("OK: file", [])):
+        with patch("circuitd.datasheet_to_decl.create_chat") as mock_create_chat:
+            with patch("circuitd.datasheet_to_decl.validate_decl_structured", return_value=("OK: file", [])):
                 with patch("circuitd.agent.save_to_stdlib", MagicMock(return_value='{"ok": true}')) as mock_save:
                     with patch("circuitd.tools.config.STDLIB_PATH", mock_stdlib_path), \
                          patch("circuitd.tools.config.STDLIB_AGENT_SUBDIR", "components/agent"):

@@ -16,8 +16,8 @@ from .prompts import (
     DECL_GENERATION_PROMPT,
     REPAIR_PROMPT,
     COMPLETENESS_VERIFY_PROMPT,
-    DATASHEET_TO_DECL_PROMPT,
 )
+from .datasheet_to_decl import convert_datasheet_to_decl, first_component_name_from_decl
 from .tools import (
     TOOL_DEFINITIONS,
     TOOL_DISPATCH,
@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 _DECL_FENCE_RE = re.compile(r"```(?:decl)?\s*\n(.*?)```", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
-_FIRST_COMPONENT_RE = re.compile(r"\bcomponent\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{", re.MULTILINE)
 
 # Tools for Phase 2 only (parts discovery + save datasheet-derived DECL to stdlib)
 PARTS_PHASE_TOOL_NAMES = (
@@ -40,15 +39,6 @@ PARTS_PHASE_TOOL_NAMES = (
 PARTS_PHASE_TOOLS = [t for t in TOOL_DEFINITIONS if t["function"]["name"] in PARTS_PHASE_TOOL_NAMES]
 PARTS_PHASE_DISPATCH = {k: v for k, v in TOOL_DISPATCH.items() if k in PARTS_PHASE_TOOL_NAMES}
 
-_DATASHEET_TO_DECL_MAX_ATTEMPTS = 20
-
-
-def _first_component_name_from_decl(decl: str) -> str | None:
-    """Return the name of the first component defined in decl, or None."""
-    m = _FIRST_COMPONENT_RE.search(decl)
-    return m.group(1) if m else None
-
-
 def _convert_datasheet_to_decl_and_save(
     datasheet_text: str,
     url: str,
@@ -56,64 +46,29 @@ def _convert_datasheet_to_decl_and_save(
     model: str | None,
     ollama_url: str | None,
 ) -> None:
-    """Convert datasheet excerpt to DECL and save to stdlib. Retries until valid DECL or max attempts. Does not raise."""
-    if not datasheet_text or len(datasheet_text.strip()) < 100:
-        logger.debug("Datasheet text too short to convert")
+    """Convert datasheet excerpt to DECL and save to stdlib. Uses datasheet_to_decl module. Does not raise."""
+    decl = convert_datasheet_to_decl(
+        datasheet_text,
+        url=url,
+        backend=backend,
+        model=model,
+        ollama_url=ollama_url,
+    )
+    if not decl:
         return
     short_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
     fallback_path = f"components/agent/datasheet_{short_hash}.decl"
-    prompt_prefix = (
-        "Convert this datasheet excerpt to a single DECL component (and optional variants). "
-        "Output ONLY a ```decl block.\n\n" + datasheet_text[:8000]
-    )
+    main_name = first_component_name_from_decl(decl)
+    save_path = f"components/agent/{main_name}.decl" if main_name else fallback_path
     try:
-        chat = create_chat(
-            backend, DATASHEET_TO_DECL_PROMPT, tools=[], tool_dispatch={},
-            model=model, ollama_url=ollama_url,
-        )
-        for attempt in range(1, _DATASHEET_TO_DECL_MAX_ATTEMPTS + 1):
-            if attempt > 1:
-                msg = (
-                    f"Previous attempt had issues. {feedback}\n\n"
-                    "Fix the DECL and output ONLY a ```decl block (no other text)."
-                )
-            else:
-                msg = prompt_prefix
-            response = chat.send(msg)
-            decl = _extract_decl(response)
-            if not decl:
-                feedback = "No ```decl code block was found in the response."
-                logger.warning("Datasheet-to-DECL attempt %d/%d: %s", attempt, _DATASHEET_TO_DECL_MAX_ATTEMPTS, feedback)
-                if attempt == _DATASHEET_TO_DECL_MAX_ATTEMPTS:
-                    logger.warning("Datasheet-to-DECL: gave up after %d attempts (no decl block)", _DATASHEET_TO_DECL_MAX_ATTEMPTS)
-                    return
-                continue
-            decl = _fix_common_issues(decl)
-            _, errors = validate_decl_structured(decl)
-            if errors:
-                feedback = "Validation errors: " + "; ".join(e.get("message", str(e)) for e in errors[:5])
-                logger.warning("Datasheet-to-DECL attempt %d/%d: %s", attempt, _DATASHEET_TO_DECL_MAX_ATTEMPTS, feedback)
-                if attempt == _DATASHEET_TO_DECL_MAX_ATTEMPTS:
-                    logger.warning("Datasheet-to-DECL: gave up after %d attempts (validation failed)", _DATASHEET_TO_DECL_MAX_ATTEMPTS)
-                    return
-                continue
-            # Name file after the main component (first component in decl)
-            main_name = _first_component_name_from_decl(decl)
-            if main_name:
-                save_path = f"components/agent/{main_name}.decl"
-            else:
-                save_path = fallback_path
-            result = save_to_stdlib(save_path, decl)
-            out = json.loads(result) if result.strip().startswith("{") else {}
-            if out.get("ok"):
-                _log_step(f"Saved datasheet DECL to stdlib: {save_path}")
-                return
-            feedback = f"Save failed: {out.get('error', result)}"
-            logger.warning("Datasheet-to-DECL attempt %d/%d: %s", attempt, _DATASHEET_TO_DECL_MAX_ATTEMPTS, feedback)
-            if attempt == _DATASHEET_TO_DECL_MAX_ATTEMPTS:
-                logger.warning("Datasheet-to-DECL: gave up after %d attempts (save failed)", _DATASHEET_TO_DECL_MAX_ATTEMPTS)
+        result = save_to_stdlib(save_path, decl)
+        out = json.loads(result) if result.strip().startswith("{") else {}
+        if out.get("ok"):
+            _log_step(f"Saved datasheet DECL to stdlib: {save_path}")
+        else:
+            logger.warning("Datasheet-to-DECL: save failed: %s", out.get("error", result))
     except Exception as exc:
-        logger.warning("Datasheet-to-DECL failed: %s", exc)
+        logger.warning("Datasheet-to-DECL save failed: %s", exc)
 
 
 def _parts_dispatch_with_auto_save(
