@@ -39,45 +39,66 @@ PARTS_PHASE_TOOL_NAMES = (
 PARTS_PHASE_TOOLS = [t for t in TOOL_DEFINITIONS if t["function"]["name"] in PARTS_PHASE_TOOL_NAMES]
 PARTS_PHASE_DISPATCH = {k: v for k, v in TOOL_DISPATCH.items() if k in PARTS_PHASE_TOOL_NAMES}
 
+_DATASHEET_TO_DECL_MAX_ATTEMPTS = 5
+
 
 def _convert_datasheet_to_decl_and_save(
     datasheet_text: str,
     url: str,
-    *,
     backend: str,
     model: str | None,
     ollama_url: str | None,
 ) -> None:
-    """Convert datasheet excerpt to DECL and save to stdlib. Logs success/failure; does not raise."""
+    """Convert datasheet excerpt to DECL and save to stdlib. Retries until valid DECL or max attempts. Does not raise."""
     if not datasheet_text or len(datasheet_text.strip()) < 100:
         logger.debug("Datasheet text too short to convert")
         return
     short_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
     save_path = f"components/agent/datasheet_{short_hash}.decl"
+    prompt_prefix = (
+        "Convert this datasheet excerpt to a single DECL component (and optional variants). "
+        "Output ONLY a ```decl block.\n\n" + datasheet_text[:8000]
+    )
     try:
         chat = create_chat(
             backend, DATASHEET_TO_DECL_PROMPT, tools=[], tool_dispatch={},
             model=model, ollama_url=ollama_url,
         )
-        response = chat.send(
-            "Convert this datasheet excerpt to a single DECL component (and optional variants). "
-            "Output ONLY a ```decl block.\n\n" + datasheet_text[:8000]
-        )
-        decl = _extract_decl(response)
-        if not decl:
-            logger.warning("Datasheet-to-DECL: no decl block in LLM response")
-            return
-        decl = _fix_common_issues(decl)
-        _, errors = validate_decl_structured(decl)
-        if errors:
-            logger.warning("Datasheet-to-DECL: validation failed for %s: %s", save_path, errors[:2])
-            return
-        result = save_to_stdlib(save_path, decl)
-        out = json.loads(result) if result.strip().startswith("{") else {}
-        if out.get("ok"):
-            _log_step(f"Saved datasheet DECL to stdlib: {save_path}")
-        else:
-            logger.warning("Datasheet-to-DECL: save failed: %s", out.get("error", result))
+        for attempt in range(1, _DATASHEET_TO_DECL_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                msg = (
+                    f"Previous attempt had issues. {feedback}\n\n"
+                    "Fix the DECL and output ONLY a ```decl block (no other text)."
+                )
+            else:
+                msg = prompt_prefix
+            response = chat.send(msg)
+            decl = _extract_decl(response)
+            if not decl:
+                feedback = "No ```decl code block was found in the response."
+                logger.warning("Datasheet-to-DECL attempt %d/%d: %s", attempt, _DATASHEET_TO_DECL_MAX_ATTEMPTS, feedback)
+                if attempt == _DATASHEET_TO_DECL_MAX_ATTEMPTS:
+                    logger.warning("Datasheet-to-DECL: gave up after %d attempts (no decl block)", _DATASHEET_TO_DECL_MAX_ATTEMPTS)
+                    return
+                continue
+            decl = _fix_common_issues(decl)
+            _, errors = validate_decl_structured(decl)
+            if errors:
+                feedback = "Validation errors: " + "; ".join(e.get("message", str(e)) for e in errors[:5])
+                logger.warning("Datasheet-to-DECL attempt %d/%d: %s", attempt, _DATASHEET_TO_DECL_MAX_ATTEMPTS, feedback)
+                if attempt == _DATASHEET_TO_DECL_MAX_ATTEMPTS:
+                    logger.warning("Datasheet-to-DECL: gave up after %d attempts (validation failed)", _DATASHEET_TO_DECL_MAX_ATTEMPTS)
+                    return
+                continue
+            result = save_to_stdlib(save_path, decl)
+            out = json.loads(result) if result.strip().startswith("{") else {}
+            if out.get("ok"):
+                _log_step(f"Saved datasheet DECL to stdlib: {save_path}")
+                return
+            feedback = f"Save failed: {out.get('error', result)}"
+            logger.warning("Datasheet-to-DECL attempt %d/%d: %s", attempt, _DATASHEET_TO_DECL_MAX_ATTEMPTS, feedback)
+            if attempt == _DATASHEET_TO_DECL_MAX_ATTEMPTS:
+                logger.warning("Datasheet-to-DECL: gave up after %d attempts (save failed)", _DATASHEET_TO_DECL_MAX_ATTEMPTS)
     except Exception as exc:
         logger.warning("Datasheet-to-DECL failed: %s", exc)
 
@@ -92,10 +113,14 @@ def _parts_dispatch_with_auto_save(
     original_get = dispatch["get_part_datasheet"]
 
     def wrapped_get_part_datasheet(url: str) -> str:
+        # So you can see on stdout whether the tool was ever invoked (convert only runs if result has text and no error)
+        print("[circuitd] get_part_datasheet called: url=", url[:80] if url else "", sep="", flush=True)
+        logger.info("get_part_datasheet called (url=%s); will convert to DECL if response has text and no error", url)
         result = original_get(url=url)
         try:
             data = json.loads(result)
-            if isinstance(data, dict) and "text" in data and "error" not in data:
+            if isinstance(data, dict) and data.get("text") and not data.get("error"):
+                logger.info("Datasheet-to-DECL: converting: %s", data)
                 _convert_datasheet_to_decl_and_save(
                     data["text"],
                     data.get("url", url),
@@ -103,8 +128,14 @@ def _parts_dispatch_with_auto_save(
                     model=model,
                     ollama_url=ollama_url,
                 )
+            else:
+                logger.warning(
+                    "Datasheet-to-DECL: skipping convert (response missing 'text' or has 'error'): has_text=%s, error=%s",
+                    isinstance(data, dict) and bool(data.get("text")),
+                    data.get("error") if isinstance(data, dict) else "n/a",
+                )
         except (json.JSONDecodeError, TypeError):
-            pass
+            logger.warning("Datasheet-to-DECL: failed to parse result: %s", result[:200] if result else "")
         return result
 
     dispatch["get_part_datasheet"] = wrapped_get_part_datasheet

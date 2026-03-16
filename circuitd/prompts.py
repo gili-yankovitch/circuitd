@@ -38,6 +38,7 @@ Return ONLY one JSON object inside a ```json block with this exact schema:
 ```
 
 Rules:
+- All names (in explicit_parts, implied_blocks, support_components, etc.) must start with an alphabetic letter; they must NOT start with a digit.
 - Include only items explicitly requested or required by the trigger rules.
 - Never invent a battery, crystal, regulator, flash, ESD, or USB data unless implied.
 - Use these trigger rules:
@@ -87,6 +88,7 @@ Return ONLY one JSON object inside a ```json block with this schema:
 ```
 
 Rules:
+- logical_name and all component/instance names must start with an alphabetic letter (not a digit).
 - Prefer stdlib components when they already match the needed function.
 - Use real manufacturer part numbers only when tool results support them.
 - If exact part selection is unresolved, use a generic component only.
@@ -128,6 +130,7 @@ Return ONLY one JSON object inside a ```json block:
 ```
 
 Rules:
+- Instance names, component type names, and net names must start with an alphabetic letter (not a digit).
 - Every power rail must be explicit as a named net.
 - Every PowerInput and PowerOutput pin must connect through nets, never directly to another pin.
 - Every IC supply pin must be connected.
@@ -147,7 +150,7 @@ DECL is NOT Verilog, C, or JSON. Syntax rules:
 - NO commas between items. NO semicolons. NO square brackets [ ].
 - Comments: // only. Blocks: { } only.
 - Parentheses only in VoltageRange(min, max) and TemperatureRange.
-- Identifiers: letters, digits, underscore. Pin names must NOT use # or + or -; use HOLD_N not HOLD#, DP/DN not D+/D-.
+- Identifiers: letters, digits, underscore. Names (component, protocol, schematic, variant, instance, net) MUST start with an alphabetic letter; they must NOT start with a digit. Pin names must NOT use # or + or -; use HOLD_N not HOLD#, DP/DN not D+/D-.
 
 Top-level: a .decl file contains zero or more of: import "path" | protocol | component | schematic | variant.
 
@@ -234,6 +237,7 @@ HARD INVARIANTS:
 8. Every net referenced in connections must be declared.
 9. Every non-optional support component in the plan must be instantiated.
 10. Preserve exact named parts from the plan.
+11. All names (component, protocol, schematic, variant, instance, net) must start with an alphabetic letter; they must NOT start with a digit.
 
 GENERATION POLICY:
 - Prefer generic reusable components for passives unless a specific part is in the plan.
@@ -266,6 +270,7 @@ Rules:
 - Preserve valid existing structure and names when possible.
 - Do not introduce new features or components unless needed to resolve an error.
 - Pay special attention to:
+  - identifiers that start with a digit (must start with an alphabetic letter)
   - undefined identifiers
   - invalid connect syntax (use connect instance.pin -- instance.pin or connect instance.pin -- net NET_NAME)
   - pin direction incompatibility
@@ -291,6 +296,7 @@ Return ONLY one ```decl block containing:
 2. Optionally one or more variant blocks if the datasheet describes package-specific pinouts.
 
 Rules:
+- Component and variant names MUST start with an alphabetic letter (e.g. use C_74HC595 or U_74HC595, not 74HC595).
 - Pin names: only letters, digits, underscores (use HOLD_N not HOLD#, DP/DN not D+/D-).
 - Numbered pins: use "N: PinType as ALIAS" (e.g. 1: PowerInput as VCC).
 - No commas, no semicolons. No prose outside the block.
@@ -451,6 +457,7 @@ DECL is NOT Verilog/C/JSON. Follow these exactly:
 - NO square brackets [ ].
 - NO parentheses except in VoltageRange(min, max) and TemperatureRange.
 - Blocks use { } braces. Comments use // only.
+- All names (component, protocol, schematic, variant, instance, net) MUST start with an alphabetic letter; they must NOT start with a digit.
 - Pin names: ONLY letters, digits, underscores. NO `#` or special characters.
   Use HOLD_N instead of HOLD#, RESET_N instead of RESET#.
 - Pin identifiers: Two formats:

@@ -774,6 +774,25 @@ def _fix_common_issues(content: str) -> str:
     # Remove blank lines that result from attribute removal (collapse double+ blank lines)
     content = re.sub(r'\n{3,}', '\n\n', content)
 
+    # Names must start with an alphabetic letter (not a digit). Prefix with C_/I_/N_ as needed.
+    content = re.sub(
+        r'\b(component|variant|protocol|schematic)\s+(\d[\w]*)',
+        r'\1 C_\2',
+        content,
+    )
+    content = re.sub(r'\bof\s+(\d[\w]*)', r'of C_\1', content)
+    content = re.sub(
+        r'\binstance\s+(\w+)\s*:\s*(\d[\w]*)',
+        r'instance \1 : C_\2',
+        content,
+    )
+    content = re.sub(
+        r'\binstance\s+(\d[\w]*)\s*:',
+        r'instance I_\1 :',
+        content,
+    )
+    content = re.sub(r'\bnet\s+(\d[\w]*)', r'net N_\1', content)
+
     return content
 
 
@@ -886,7 +905,7 @@ def validate_decl_structured(content: str, base_path: Path | None = None) -> tup
         output = "(no output)"
     output = _annotate_errors(output, _fix_common_issues(content))
     structured = [] if is_ok else _parse_validation_errors(stdout + "\n" + stderr)
-    protocol_errors = validate_decl_protocol_pins(content)
+    protocol_errors = validate_decl_protocol_pins(_fix_common_issues(content))
     if protocol_errors:
         structured = structured + protocol_errors
         output += "\n\nProtocol pin validation failed:\n" + "\n".join(
