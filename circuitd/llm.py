@@ -173,8 +173,13 @@ class ChatBase(ABC):
         rest = self.messages[1:]
 
         keep = min(self.KEEP_RECENT_MESSAGES, len(rest))
-        to_summarize = rest[: len(rest) - keep]
-        to_keep = rest[len(rest) - keep :]
+        start_keep = len(rest) - keep
+        # OpenAI (and similar APIs) require every "tool" message to follow an "assistant" message with "tool_calls".
+        # Ensure we never leave a leading "tool" in to_keep by expanding backwards to include its assistant.
+        while start_keep > 0 and rest[start_keep].get("role") == "tool":
+            start_keep -= 1
+        to_summarize = rest[:start_keep]
+        to_keep = rest[start_keep:]
 
         if not to_summarize:
             return
