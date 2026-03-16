@@ -275,6 +275,28 @@ Rules:
 """
 
 # ---------------------------------------------------------------------------
+# Datasheet → DECL (auto-run when a datasheet is downloaded)
+# ---------------------------------------------------------------------------
+
+DATASHEET_TO_DECL_PROMPT = r"""You are a DECL component writer. Given a datasheet excerpt (pinout, electrical characteristics, package), produce exactly one DECL component definition.
+
+""" + DECL_LANGUAGE_DEFINITION + r"""
+
+Task:
+From the datasheet text below, extract the part name, all pins (with correct directions: PowerInput, PowerOutput, Input, Output, Bidirectional, Passive, etc.), and any key attributes (voltage, current, package, memory size, etc.). Use only the attribute types listed in the language definition.
+
+Output:
+Return ONLY one ```decl block containing:
+1. One component definition (name = part number or logical name, e.g. W25Q128JV or AMS1117_3V3).
+2. Optionally one or more variant blocks if the datasheet describes package-specific pinouts.
+
+Rules:
+- Pin names: only letters, digits, underscores (use HOLD_N not HOLD#, DP/DN not D+/D-).
+- Numbered pins: use "N: PinType as ALIAS" (e.g. 1: PowerInput as VCC).
+- No commas, no semicolons. No prose outside the block.
+"""
+
+# ---------------------------------------------------------------------------
 # Completeness verification (LLM-based: which "missing" items are actually present?)
 # ---------------------------------------------------------------------------
 
