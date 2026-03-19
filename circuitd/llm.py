@@ -17,6 +17,54 @@ from .prompts import STATE_SUMMARY_PROMPT
 
 logger = logging.getLogger(__name__)
 
+# OpenAI / httpx expect valid UTF-8 and JSON. PDF/tool blobs may contain NULs or
+# lone surrogates that confuse some HTTP stacks or middleboxes.
+def _sanitize_openai_text(s: str) -> str:
+    if not s:
+        return s
+    s = s.replace("\x00", "")
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        s = s.encode("utf-8", errors="replace").decode("utf-8")
+    return s
+
+
+def _sanitize_openai_messages(messages: list[dict[str, Any]]) -> None:
+    """Normalize message strings in place before each OpenAI HTTP request."""
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            m["content"] = _sanitize_openai_text(c)
+        tcs = m.get("tool_calls")
+        if not tcs:
+            continue
+        for tc in tcs:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                fn["arguments"] = _sanitize_openai_text(args)
+
+
+def _tool_args_to_json_str(arguments: dict[str, Any]) -> str:
+    try:
+        return json.dumps(
+            arguments,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning("Tool arguments not JSON-safe (%s); using default=str", exc)
+        return json.dumps(
+            arguments,
+            ensure_ascii=True,
+            allow_nan=False,
+            default=str,
+            separators=(",", ":"),
+        )
+
+
 # Strip older ```decl ...``` blocks from chat history (keep latest only).
 _DECL_BLOCK_RE = re.compile(r"```decl\s*\n.*?```", re.DOTALL | re.IGNORECASE)
 
@@ -501,22 +549,43 @@ class OpenAIChat(ChatBase):
         model: str | None = None,
         api_key: str | None = None,
     ):
-        super().__init__(system_prompt, tools, tool_dispatch)
+        super().__init__(
+            _sanitize_openai_text(system_prompt),
+            tools,
+            tool_dispatch,
+        )
         self.SUMMARY_CHAR_THRESHOLD = getattr(
             config, "OPENAI_SUMMARY_CHAR_THRESHOLD", 110_000
         )
-        self.model = model or config.OPENAI_MODEL
-        self._api_key = api_key or config.OPENAI_API_KEY
+        self.model = (model or config.OPENAI_MODEL or "gpt-4o").strip() or "gpt-4o"
+        raw_key = api_key or config.OPENAI_API_KEY
+        self._api_key = "".join((raw_key or "").split())
         if not self._api_key:
             raise RuntimeError("OpenAI API key not found. Place it in openai.key")
 
         from openai import OpenAI
-        self._client = OpenAI(api_key=self._api_key, timeout=config.OPENAI_TIMEOUT)
+
+        client_kw: dict[str, Any] = {
+            "api_key": self._api_key,
+            "timeout": config.OPENAI_TIMEOUT,
+        }
+        base_url = getattr(config, "OPENAI_BASE_URL", None)
+        if base_url:
+            client_kw["base_url"] = base_url
+        self._client = OpenAI(**client_kw)
+
+    def send(self, user_message: str) -> str:
+        user_message = _sanitize_openai_text(user_message)
+        self._squeeze_context_no_llm()
+        if self._total_chars() >= self.SUMMARY_CHAR_THRESHOLD:
+            self._summarize_via_llm()
+        self.messages.append({"role": "user", "content": user_message})
+        return self._run_loop()
 
     def _call_summary_api(self, transcript: str) -> str:
         summary_messages = [
-            {"role": "system", "content": STATE_SUMMARY_PROMPT},
-            {"role": "user", "content": transcript},
+            {"role": "system", "content": _sanitize_openai_text(STATE_SUMMARY_PROMPT)},
+            {"role": "user", "content": _sanitize_openai_text(transcript)},
         ]
         _log_prompts_to_file(summary_messages, label="Summary/state compression request (OpenAI)")
         response = self._client.chat.completions.create(
@@ -528,6 +597,7 @@ class OpenAIChat(ChatBase):
         return content
 
     def _call_api(self) -> tuple[str, list[dict]]:
+        _sanitize_openai_messages(self.messages)
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": self.messages,
@@ -535,10 +605,29 @@ class OpenAIChat(ChatBase):
         if self.tools:
             kwargs["tools"] = self.tools
 
+        from openai import APIStatusError
+
         for attempt in range(3):
             try:
                 response = self._client.chat.completions.create(**kwargs)
                 break
+            except APIStatusError as exc:
+                resp = getattr(exc, "response", None)
+                body_preview = ""
+                if resp is not None:
+                    try:
+                        body_preview = (resp.text or "")[:800]
+                    except Exception:
+                        body_preview = ""
+                logger.warning(
+                    "OpenAI HTTP error (attempt %d/3): %s — response body (truncated): %r",
+                    attempt + 1,
+                    exc,
+                    body_preview,
+                )
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
             except Exception as exc:
                 logger.warning("OpenAI error (attempt %d/3): %s", attempt + 1, exc)
                 if attempt == 2:
@@ -563,7 +652,10 @@ class OpenAIChat(ChatBase):
         return content, tool_calls
 
     def _append_assistant(self, content: str, tool_calls: list[dict]) -> None:
-        msg: dict[str, Any] = {"role": "assistant", "content": content}
+        msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": _sanitize_openai_text(content or ""),
+        }
         if tool_calls:
             msg["tool_calls"] = [
                 {
@@ -571,7 +663,7 @@ class OpenAIChat(ChatBase):
                     "type": "function",
                     "function": {
                         "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"]),
+                        "arguments": _tool_args_to_json_str(tc["arguments"]),
                     },
                 }
                 for tc in tool_calls
@@ -579,10 +671,11 @@ class OpenAIChat(ChatBase):
         self.messages.append(msg)
 
     def _append_tool_result(self, tool_call: dict, result: str) -> None:
+        text = result if isinstance(result, str) else str(result)
         self.messages.append({
             "role": "tool",
             "tool_call_id": tool_call["id"],
-            "content": result,
+            "content": _sanitize_openai_text(text),
         })
 
 

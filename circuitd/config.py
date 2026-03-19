@@ -1,5 +1,6 @@
 """Configuration constants for the circuitd agent."""
 
+import os
 from pathlib import Path
 
 # -- LLM Backend Selection ---------------------------------------------------
@@ -18,8 +19,24 @@ OLLAMA_SUMMARY_CHAR_THRESHOLD = 40_000
 # -- OpenAI ------------------------------------------------------------------
 
 _key_file = Path(__file__).resolve().parent.parent / "openai.key"
-OPENAI_API_KEY = _key_file.read_text().strip() if _key_file.is_file() else ""
-OPENAI_MODEL = "gpt-4o"
+# Strip BOM/newlines/whitespace — accidental line breaks in the key file or env
+# can corrupt the Authorization header and cause bizarre HTTP 400s from the API.
+def _normalize_openai_secret(raw: str) -> str:
+    return "".join(raw.strip().split())
+
+
+_env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+if _env_key:
+    OPENAI_API_KEY = _normalize_openai_secret(_env_key)
+elif _key_file.is_file():
+    OPENAI_API_KEY = _normalize_openai_secret(
+        _key_file.read_text(encoding="utf-8-sig", errors="replace")
+    )
+else:
+    OPENAI_API_KEY = ""
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
+# Optional (Azure, proxies, local gateways). Empty = default OpenAI API.
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
 OPENAI_TIMEOUT = 300
 # Summarization runs only when context exceeds this (chars). OpenAI models have large
 # windows — keep this high to avoid thrashing on full DECL + validator output.

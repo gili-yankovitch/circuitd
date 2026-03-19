@@ -192,6 +192,8 @@ component NAME {
 The `requires` block declares support components this part needs to function (decoupling caps, crystals, etc.). When instantiating a component in a schematic, also instantiate and connect all its `requires` entries. Attribute overrides use `=`. The `* COUNT` multiplier is optional (default 1).
 
 Pin types: Input, Output, Bidirectional, TriState, Passive, Free, PowerInput, PowerOutput, Unconnected, Analog, OpenDrain.
+Never use ``InputOutput`` or ``InOut`` — use **Bidirectional** for dual-direction pins (e.g. SWD, GPIO).
+Each pin line must start with **one** package pin number (decimal integer): ``12: Bidirectional as GPIO4`` — never ``12_29:`` or other compound numbers on one line (use one line per package pin, or a ``variant`` pinout block).
 
 ### Variant (package-specific pinout)
 variant NAME of BASE_COMPONENT {
@@ -331,9 +333,28 @@ Return ONLY one ```decl block containing:
 Rules:
 - Component and variant names MUST start with an alphabetic letter (e.g. use C_74HC595 or U_74HC595, not 74HC595).
 - Pin names: MUST START WITH AN ALPHABETIC LETTER ONLY; they must NOT start with a digit. They can contain only letters, digits, underscores (use HOLD_N not HOLD#, DP/DN not D+/D-).
-- Numbered pins: use "N: PinType as ALIAS" (e.g. 1: PowerInput as VCC).
+- Numbered pins: use "N: PinType as ALIAS" (e.g. 1: PowerInput as VCC). **N must be one integer per line** — never "12_29: ..." on a single line. Use **Bidirectional**, not InputOutput/InOut.
 - No commas, no semicolons. No prose outside the block.
 - USE IMPORTS for protocols; never paste protocol definitions inline.
+"""
+
+# Appended when converting from a PDF via tools (get_part_datasheet / read_datasheet_pages)
+DATASHEET_PDF_ITERATIVE_INSTR = r"""
+## PDF workflow (tools enabled)
+
+When the user gives a `file:///...` URI or you are told the source is a local/remote PDF:
+
+1. **Always** call `get_part_datasheet` first with that exact URL string. This returns `total_pages` and a short preview only.
+2. **Then** call `read_datasheet_pages(url, start_page, end_page)` **repeatedly** with the same `url`, using small ranges (e.g. 10–25 pages), until you have:
+   - Pin names / ball map / GPIO table
+   - Power pins (VDD, VSS, VDDCORE, etc.)
+   - Any buses (SPI, I2C, USB) and their pin mapping
+   - Package section if you emit variant pinouts
+3. Do **not** guess pins from the cover or TOC alone — read the pages that contain tables.
+4. You may call `validate_decl` on a draft `content` string to catch errors before the final answer.
+5. Your **final** message must contain **only** one ```decl fenced block (full prose-free output rule above still applies).
+
+**Syntax reminders (checker failures):** no placeholder lines like `name: Type = value` in attributes. Pin types must be exactly the DECL keywords (Bidirectional for SWD/GPIO, never InputOutput). One package pin index per line (integer before `:`).
 """
 
 # ---------------------------------------------------------------------------

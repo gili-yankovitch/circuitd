@@ -5,6 +5,7 @@ import logging
 import re
 import subprocess
 import tempfile
+from urllib.parse import unquote, urlparse
 from pathlib import Path
 
 import requests
@@ -561,17 +562,20 @@ TOOL_DEFINITIONS: list[dict] = [
         "function": {
             "name": "get_part_datasheet",
             "description": (
-                "Download a component datasheet PDF and return an overview: "
-                "total page count, total character count, and the text of the "
-                "first 2 pages. Use read_datasheet_pages to read further pages "
-                "(e.g. pinout tables, electrical specs, application circuits)."
+                "Open a datasheet PDF and return an overview: total page count, "
+                "total characters, and text of the first few pages. "
+                "Supports https:// URLs, file:///absolute/path.pdf, or a filesystem path "
+                "to a local .pdf. Always call this first, then use read_datasheet_pages "
+                "to pull pinout, electrical, and package sections page-by-page."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Full URL to the datasheet PDF",
+                        "description": (
+                            "Datasheet PDF: https://... URL, file:///path/to.pdf, or local path"
+                        ),
                     },
                 },
                 "required": ["url"],
@@ -583,17 +587,16 @@ TOOL_DEFINITIONS: list[dict] = [
         "function": {
             "name": "read_datasheet_pages",
             "description": (
-                "Read specific pages from a previously downloaded datasheet PDF. "
-                "Call get_part_datasheet first to download and see page count. "
-                "Use this to iteratively read pinout tables, electrical specs, "
-                "application circuits, and other sections on later pages."
+                "Read a page range from the same PDF opened with get_part_datasheet. "
+                "Use the exact same url string. Call iteratively for pinout tables, "
+                "electrical characteristics, max ratings, and package drawings."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Same URL passed to get_part_datasheet",
+                        "description": "Exact same url argument as get_part_datasheet",
                     },
                     "start_page": {
                         "type": "integer",
@@ -616,7 +619,11 @@ TOOL_DEFINITIONS: list[dict] = [
                 "List all components and protocols available in the DECL standard "
                 "library. Returns file names grouped by category."
             ),
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
         },
     },
     {
@@ -736,19 +743,57 @@ _pdf_cache: dict[str, list[str]] = {}
 _DATASHEET_PAGE_CAP = 6000
 
 
+def _local_pdf_path(raw: str) -> Path | None:
+    """If raw is a file:// URI or path to an existing .pdf, return its path."""
+    s = raw.strip()
+    if s.startswith("file://"):
+        parsed = urlparse(s)
+        path = Path(unquote(parsed.path))
+        if not path.is_file() and parsed.netloc:
+            path = Path(f"//{parsed.netloc}{unquote(parsed.path)}")
+        if path.is_file() and path.suffix.lower() == ".pdf":
+            return path.resolve()
+        return None
+    p = Path(s)
+    if p.is_file() and p.suffix.lower() == ".pdf":
+        return p.resolve()
+    return None
+
+
+def _pdf_cache_key(url: str) -> str:
+    """Normalize URL/path so local files and file:// URIs share one cache entry."""
+    lp = _local_pdf_path(url)
+    if lp is not None:
+        return str(lp)
+    return url.strip()
+
+
 def _ensure_pdf_cached(url: str) -> list[str] | str:
-    """Download PDF if not cached. Returns list of page texts or an error string."""
-    if url in _pdf_cache:
-        return _pdf_cache[url]
+    """Load PDF into page list (HTTP download or local file). Returns list or error string."""
+    key = _pdf_cache_key(url)
+    if key in _pdf_cache:
+        return _pdf_cache[key]
 
-    if not url or not url.startswith("http"):
-        return "Invalid datasheet URL"
+    pdf_bytes: bytes | None = None
 
-    try:
-        resp = requests.get(url, timeout=30, headers={"User-Agent": "circuitd/1.0"})
-        resp.raise_for_status()
-    except Exception as exc:
-        return f"Failed to download datasheet: {exc}"
+    local = _local_pdf_path(url)
+    if local is not None:
+        try:
+            pdf_bytes = local.read_bytes()
+        except OSError as exc:
+            return f"Failed to read local PDF: {exc}"
+    elif url.strip().startswith(("http://", "https://")):
+        try:
+            resp = requests.get(url.strip(), timeout=30, headers={"User-Agent": "circuitd/1.0"})
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+        except Exception as exc:
+            return f"Failed to download datasheet: {exc}"
+    else:
+        return (
+            "Invalid datasheet reference: use https:// URL, file:///absolute/path.pdf, "
+            "or an absolute/relative path to a .pdf file"
+        )
 
     try:
         import pymupdf
@@ -756,7 +801,6 @@ def _ensure_pdf_cached(url: str) -> list[str] | str:
         return "pymupdf not installed -- run: pip install pymupdf"
 
     try:
-        pdf_bytes = resp.content
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         pages: list[str] = []
         for page in doc:
@@ -765,7 +809,9 @@ def _ensure_pdf_cached(url: str) -> list[str] | str:
     except Exception as exc:
         return f"Failed to parse PDF: {exc}"
 
-    _pdf_cache[url] = pages
+    _pdf_cache[key] = pages
+    for alias in (url.strip(), key):
+        _pdf_cache[alias] = pages
     return pages
 
 
@@ -957,6 +1003,41 @@ def _fix_common_issues(content: str) -> str:
         content,
     )
     content = re.sub(r'\bnet\s+(\d[\w]*)', r'net N_\1', content)
+
+    # Nonstandard pin-type spellings (not in DECL grammar — parser expects
+    # Input, Output, Bidirectional, …).
+    content = re.sub(r'\bInputOutput\b', 'Bidirectional', content)
+    content = re.sub(r'\bInOut\b', 'Bidirectional', content)
+
+    # LLM placeholder rows in attributes { } (from templates like "name: Type = value")
+    content = re.sub(
+        r'^\s*\w+\s*:\s*Type\s*=\s*value\s*$',
+        '',
+        content,
+        flags=re.MULTILINE,
+    )
+
+    # Pin index must be one integer before ':'. Expand mistakes like "12_29: Type as ...".
+    lines = content.splitlines()
+    out_pin: list[str] = []
+    pin_range_line = re.compile(r'^(\s*)(\d+)_(\d+):\s*(\w+)\s+as\s+(\w+)\s*$')
+    for line in lines:
+        m = pin_range_line.match(line)
+        if not m:
+            out_pin.append(line)
+            continue
+        indent, a_s, b_s, ptype, _alias = m.groups()
+        a, b = int(a_s), int(b_s)
+        if a > b:
+            a, b = b, a
+        if b - a > 96:
+            out_pin.append(line)
+            continue
+        for n in range(a, b + 1):
+            out_pin.append(f"{indent}{n}: {ptype} as pin_{n}")
+    content = "\n".join(out_pin)
+
+    content = re.sub(r'\n{3,}', '\n\n', content)
 
     return content
 
