@@ -17,6 +17,9 @@ from .prompts import STATE_SUMMARY_PROMPT
 
 logger = logging.getLogger(__name__)
 
+# Strip older ```decl ...``` blocks from chat history (keep latest only).
+_DECL_BLOCK_RE = re.compile(r"```decl\s*\n.*?```", re.DOTALL | re.IGNORECASE)
+
 # Max chars per message in prompts log (avoid huge files from tool results)
 _PROMPTS_LOG_MAX_MESSAGE_CHARS = 100_000
 
@@ -99,8 +102,8 @@ def _log_response_to_file(
 class ChatBase(ABC):
     """Common interface for LLM chat backends."""
 
-    SUMMARY_CHAR_THRESHOLD = 35000
-    KEEP_RECENT_MESSAGES = 6
+    SUMMARY_CHAR_THRESHOLD = 50000
+    KEEP_RECENT_MESSAGES = 10
 
     def __init__(
         self,
@@ -121,7 +124,9 @@ class ChatBase(ABC):
         return self._last_validated
 
     def send(self, user_message: str) -> str:
-        self._maybe_summarize()
+        self._squeeze_context_no_llm()
+        if self._total_chars() >= self.SUMMARY_CHAR_THRESHOLD:
+            self._summarize_via_llm()
         self.messages.append({"role": "user", "content": user_message})
         return self._run_loop()
 
@@ -158,14 +163,79 @@ class ChatBase(ABC):
                     return s
         return text
 
-    def _maybe_summarize(self):
-        """If context is over budget, summarize older messages and compact."""
+    def _squeeze_context_no_llm(self) -> None:
+        """Shrink history without an LLM call: stale DECL + old tool blobs."""
+        if len(self.messages) <= 1:
+            return
+        before = self._total_chars()
+        self._strip_stale_decl_blocks_inplace()
+        self._truncate_old_tool_results_inplace()
+        after = self._total_chars()
+        if after < before:
+            logger.info(
+                "Context squeezed (no LLM): %d -> %d chars, %d messages",
+                before, after, len(self.messages),
+            )
+
+    def _strip_stale_decl_blocks_inplace(self) -> None:
+        """Replace all but the last ```decl ...``` fenced block with a short placeholder.
+
+        Only messages that actually contain a full ```decl ... ``` fence are considered,
+        so placeholders and prose mentioning 'decl' do not confuse the keeper logic.
+        """
+        indices: list[int] = []
+        for i, m in enumerate(self.messages):
+            if i == 0:
+                continue
+            c = m.get("content") or ""
+            if _DECL_BLOCK_RE.search(c):
+                indices.append(i)
+        if len(indices) <= 1:
+            return
+        ph = "[earlier .decl revision omitted — latest schematic is in the last decl fence above]"
+        for i in indices[:-1]:
+            c = self.messages[i].get("content") or ""
+            self.messages[i]["content"] = _DECL_BLOCK_RE.sub(ph, c)
+
+    def _truncate_old_tool_results_inplace(
+        self,
+        keep_full_last: int = 4,
+        max_old_len: int = 1200,
+    ) -> None:
+        tool_indices = [
+            i for i, m in enumerate(self.messages) if m.get("role") == "tool"
+        ]
+        if len(tool_indices) <= keep_full_last:
+            return
+        for i in tool_indices[:-keep_full_last]:
+            c = self.messages[i].get("content") or ""
+            if len(c) > max_old_len:
+                self.messages[i]["content"] = (
+                    c[:max_old_len]
+                    + f"\n... ({len(c) - max_old_len} chars omitted) ..."
+                )
+
+    def _hard_squeeze_if_still_oversized(self) -> None:
+        """Last resort when still over threshold: aggressive tool trim + stale decl."""
+        self._strip_stale_decl_blocks_inplace()
+        self._truncate_old_tool_results_inplace(keep_full_last=2, max_old_len=600)
+        for i, m in enumerate(self.messages):
+            if i == 0 or m.get("role") != "user":
+                continue
+            if i >= len(self.messages) - 2:
+                continue
+            c = m.get("content") or ""
+            if len(c) > 6000:
+                m["content"] = c[:4000] + "\n... (long user message truncated) ..."
+
+    def _summarize_via_llm(self) -> None:
+        """Summarize older messages via LLM (expensive — only from send(), not each tool round)."""
         total = self._total_chars()
         if total < self.SUMMARY_CHAR_THRESHOLD:
             return
 
         logger.info(
-            "Context at %d chars (threshold %d), summarizing...",
+            "Context at %d chars (threshold %d), summarizing via LLM...",
             total, self.SUMMARY_CHAR_THRESHOLD,
         )
 
@@ -174,14 +244,13 @@ class ChatBase(ABC):
 
         keep = min(self.KEEP_RECENT_MESSAGES, len(rest))
         start_keep = len(rest) - keep
-        # OpenAI (and similar APIs) require every "tool" message to follow an "assistant" message with "tool_calls".
-        # Ensure we never leave a leading "tool" in to_keep by expanding backwards to include its assistant.
         while start_keep > 0 and rest[start_keep].get("role") == "tool":
             start_keep -= 1
         to_summarize = rest[:start_keep]
         to_keep = rest[start_keep:]
 
         if not to_summarize:
+            self._hard_squeeze_if_still_oversized()
             return
 
         transcript = self._format_for_summary(to_summarize)
@@ -194,7 +263,6 @@ class ChatBase(ABC):
             self._trim_tool_results()
             return
 
-        # Prefer structured state JSON; fall back to raw summary if not valid JSON
         state_json = summary
         try:
             parsed = json.loads(self._extract_state_json(summary))
@@ -205,46 +273,48 @@ class ChatBase(ABC):
 
         self.messages = [
             system_msg,
-            {"role": "user", "content": f"[CONTEXT COMPRESSED]\nCurrent state:\n{state_json}"},
-            {"role": "assistant", "content": "Understood. I have the context from the state above. I will continue the circuit design from where we left off."},
+            {"role": "user", "content": f"[STATE]\n{state_json}"},
+            {"role": "assistant", "content": "Continuing."},
             *to_keep,
         ]
+        self._squeeze_context_no_llm()
+        if self._total_chars() >= self.SUMMARY_CHAR_THRESHOLD:
+            self._hard_squeeze_if_still_oversized()
         logger.info(
-            "Context compacted: %d -> %d chars, %d messages",
+            "Context compacted via LLM: was %d chars -> now %d chars, %d messages",
             total, self._total_chars(), len(self.messages),
         )
 
     def _format_for_summary(self, messages: list[dict]) -> str:
-        """Turn a slice of messages into a readable transcript for the summarizer."""
+        """Turn a slice of messages into a compact transcript for the summarizer.
+
+        Only keeps the essentials: user requests, tool call names, and the
+        latest DECL/JSON output.  Tool results and intermediate assistant prose
+        are aggressively truncated.
+        """
         parts: list[str] = []
         for m in messages:
             role = m.get("role", "?")
-            content = (m.get("content") or "")[:2000]
+            content = m.get("content") or ""
             tool_calls = m.get("tool_calls") or []
 
             if role == "tool":
-                parts.append(f"[tool result]: {content[:800]}")
+                parts.append(f"[tool result]: {content[:300]}")
             elif tool_calls:
-                calls_desc = []
+                names = []
                 for tc in tool_calls:
                     fn = tc.get("function") or tc
-                    name = fn.get("name", "?")
-                    args = fn.get("arguments", "")
-                    if isinstance(args, dict):
-                        args = json.dumps(args, default=str)
-                    calls_desc.append(f"  {name}({str(args)[:200]})")
-                parts.append(f"[assistant calls tools]:\n" + "\n".join(calls_desc))
-                if content:
-                    parts.append(f"[assistant text]: {content[:500]}")
+                    names.append(fn.get("name", "?"))
+                parts.append(f"[assistant called]: {', '.join(names)}")
             elif role == "assistant":
-                parts.append(f"[assistant]: {content}")
+                parts.append(f"[assistant]: {content[:600]}")
             elif role == "user":
-                parts.append(f"[user]: {content}")
+                parts.append(f"[user]: {content[:800]}")
 
-        full = "\n\n".join(parts)
-        max_len = 12000
+        full = "\n".join(parts)
+        max_len = 4000
         if len(full) > max_len:
-            full = full[:max_len] + "\n... (transcript truncated) ..."
+            full = full[-max_len:]
         return full
 
     def _trim_tool_results(self):
@@ -277,7 +347,11 @@ class ChatBase(ABC):
         validate_ok_count = 0
 
         for _ in range(config.MAX_AGENT_ITERATIONS):
-            self._maybe_summarize()
+            # Never call the summary LLM here — only cheap squeezes. LLM summary runs at
+            # most once per send() to avoid thrashing during repair tool loops.
+            self._squeeze_context_no_llm()
+            if self._total_chars() >= self.SUMMARY_CHAR_THRESHOLD:
+                self._hard_squeeze_if_still_oversized()
             _log_prompts_to_file(self.messages, label="LLM request")
             content, tool_calls = self._call_api()
             _log_response_to_file(content, tool_calls, label="LLM response")
@@ -312,8 +386,6 @@ class ChatBase(ABC):
 
 class OllamaChat(ChatBase):
 
-    SUMMARY_CHAR_THRESHOLD = 30000
-
     def __init__(
         self,
         system_prompt: str,
@@ -326,9 +398,14 @@ class OllamaChat(ChatBase):
         super().__init__(system_prompt, tools, tool_dispatch)
         self.base_url = (base_url or config.OLLAMA_URL).rstrip("/")
         self.model = model or config.OLLAMA_MODEL
+        self.SUMMARY_CHAR_THRESHOLD = getattr(
+            config, "OLLAMA_SUMMARY_CHAR_THRESHOLD", 40_000
+        )
 
     def send(self, user_message: str) -> str:
-        self._maybe_summarize()
+        self._squeeze_context_no_llm()
+        if self._total_chars() >= self.SUMMARY_CHAR_THRESHOLD:
+            self._summarize_via_llm()
         self.messages.append({"role": "user", "content": "/nothink\n" + user_message})
         return self._run_loop()
 
@@ -415,8 +492,6 @@ class OllamaChat(ChatBase):
 
 class OpenAIChat(ChatBase):
 
-    SUMMARY_CHAR_THRESHOLD = 20000
-
     def __init__(
         self,
         system_prompt: str,
@@ -427,6 +502,9 @@ class OpenAIChat(ChatBase):
         api_key: str | None = None,
     ):
         super().__init__(system_prompt, tools, tool_dispatch)
+        self.SUMMARY_CHAR_THRESHOLD = getattr(
+            config, "OPENAI_SUMMARY_CHAR_THRESHOLD", 110_000
+        )
         self.model = model or config.OPENAI_MODEL
         self._api_key = api_key or config.OPENAI_API_KEY
         if not self._api_key:

@@ -25,6 +25,8 @@ from .tools import (
     _fix_common_issues,
     save_to_stdlib,
     get_stdlib_component_decl,
+    extract_requires_from_decl,
+    _expand_decl_imports,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,8 @@ _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
 # Tools for Phase 2 only (parts discovery + save datasheet-derived DECL to stdlib)
 PARTS_PHASE_TOOL_NAMES = (
-    "list_stdlib", "read_stdlib_file", "search_parts", "get_part_datasheet", "save_to_stdlib",
+    "list_stdlib", "read_stdlib_file", "search_parts", "get_part_datasheet",
+    "read_datasheet_pages", "save_to_stdlib",
 )
 PARTS_PHASE_TOOLS = [t for t in TOOL_DEFINITIONS if t["function"]["name"] in PARTS_PHASE_TOOL_NAMES]
 PARTS_PHASE_DISPATCH = {k: v for k, v in TOOL_DISPATCH.items() if k in PARTS_PHASE_TOOL_NAMES}
@@ -439,6 +442,80 @@ def _run_phase5_repair_loop(
 
 
 # ---------------------------------------------------------------------------
+# Requires-aware completeness
+# ---------------------------------------------------------------------------
+
+def _check_requires_completeness(
+    decl_code: str,
+    *,
+    backend: str,
+    model: str | None,
+    ollama_url: str | None,
+) -> str:
+    """Check that components' `requires` entries are satisfied in the schematic.
+
+    Expands imports so that stdlib components' requires blocks are visible,
+    then verifies that the schematic contains enough support parts.
+    """
+    try:
+        sp = Path(config.STDLIB_PATH)
+        expanded = _expand_decl_imports(decl_code, sp, stdlib_root=sp)
+    except Exception:
+        expanded = decl_code
+    reqs = extract_requires_from_decl(expanded)
+    if not reqs:
+        return decl_code
+
+    instance_types: dict[str, int] = {}
+    for m in re.finditer(r"instance\s+\w+\s*:\s*(\w+)", decl_code):
+        ctype = m.group(1)
+        instance_types[ctype] = instance_types.get(ctype, 0) + 1
+
+    missing_parts: list[str] = []
+    for comp_type, attrs, count in reqs:
+        actual = instance_types.get(comp_type, 0)
+        if actual < count:
+            attr_str = ", ".join(f"{k}={v}" for k, v in attrs.items())
+            desc = f"{comp_type}"
+            if attr_str:
+                desc += f" ({attr_str})"
+            missing_parts.append(f"- Need {count}x {desc}, have {actual}")
+
+    if not missing_parts:
+        _log_step("Requires check: all required support components present")
+        return decl_code
+
+    _log_step(f"Requires check: {len(missing_parts)} missing support requirement(s)")
+    for m in missing_parts:
+        _log_step(f"  {m}")
+
+    _log_phase_to_prompts_file("Requires completeness: add missing support components")
+    chat = create_chat(
+        backend, REPAIR_PROMPT, tools=[], tool_dispatch={},
+        model=model, ollama_url=ollama_url,
+    )
+    missing_text = "\n".join(missing_parts)
+    user_msg = (
+        "The .decl file below is valid but is missing required support components "
+        "declared in `requires` blocks. Add the missing instances and connect them "
+        "appropriately.\n\n"
+        f"Missing requirements:\n{missing_text}\n\n"
+        "Current .decl:\n\n"
+        f"```decl\n{decl_code}\n```"
+    )
+    response = chat.send(user_msg)
+    new_decl = _extract_decl(response)
+    if not new_decl:
+        _log_step("No decl block in response; keeping current version")
+        return decl_code
+    decl_code = _fix_common_issues(new_decl)
+    decl_code = _run_phase5_repair_loop(
+        decl_code, backend=backend, model=model, ollama_url=ollama_url,
+    )
+    return decl_code
+
+
+# ---------------------------------------------------------------------------
 # Main entry: 5-phase pipeline
 # ---------------------------------------------------------------------------
 
@@ -525,6 +602,11 @@ def run_agent(
         decl_code = _run_phase5_repair_loop(
             decl_code, backend=backend, model=model, ollama_url=ollama_url,
         )
+
+    # Requires-aware completeness: check that all requires entries from components are satisfied
+    decl_code = _check_requires_completeness(
+        decl_code, backend=backend, model=model, ollama_url=ollama_url,
+    )
 
     out = Path(output_path)
     out.write_text(decl_code + "\n")

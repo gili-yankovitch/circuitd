@@ -20,8 +20,51 @@ _VALIDATION_ERROR_RE = re.compile(
 )
 _ERROR_CODE_RE = re.compile(r"\b(E00[1-9]|E010)\b")
 
-# Import line: import "path" (path may be relative)
-_IMPORT_LINE_RE = re.compile(r'^\s*import\s+"([^"]+)"\s*$')
+# import "path" — relative to current file's directory (plus optional stdlib fallback)
+_IMPORT_QUOTED_RE = re.compile(r'^\s*import\s+"([^"]+)"\s*$')
+# import <path> — stdlib root only (C-style system include)
+_IMPORT_SYSTEM_RE = re.compile(r"^\s*import\s+<([^>]+)>\s*$")
+
+
+class DeclImportError(FileNotFoundError):
+    """An import path could not be resolved to an existing file."""
+
+    def __init__(self, import_path: str, tried: list[Path], *, system: bool = False):
+        self.import_path = import_path
+        self.tried = tried
+        self.system = system
+        paths = ", ".join(str(p) for p in tried) if tried else "(no paths)"
+        kind = f"<{import_path}>" if system else f'"{import_path}"'
+        super().__init__(f"Import not found: {kind} (tried: {paths})")
+
+
+def _resolve_import_path(
+    path_str: str,
+    base_path: Path,
+    stdlib_root: Path | None,
+    *,
+    is_system: bool,
+) -> Path:
+    """Resolve ``import <path>`` (stdlib root) or ``import \"path\"`` (relative + fallback)."""
+    path_str = path_str.strip().replace("\\", "/")
+    if is_system:
+        if stdlib_root is None or not Path(stdlib_root).is_dir():
+            raise DeclImportError(path_str, [], system=True)
+        p = (Path(stdlib_root).resolve() / path_str).resolve()
+        if p.is_file():
+            return p
+        raise DeclImportError(path_str, [p], system=True)
+    primary = (base_path / path_str).resolve()
+    if primary.is_file():
+        return primary
+    tried = [primary]
+    if stdlib_root is not None:
+        alt = (Path(stdlib_root).resolve() / path_str).resolve()
+        if alt not in tried:
+            tried.append(alt)
+            if alt.is_file():
+                return alt
+    raise DeclImportError(path_str, tried, system=False)
 
 # Protocol-pin validation: extract protocols, external features, and connections from DECL text
 _LINE_TO_PIN_RE = re.compile(r"(\w+)\s*->\s*pin\s+(\w+)")
@@ -144,7 +187,12 @@ def _load_stdlib_protocols_and_features_for_component(
             continue
         if not comp_or_variant_re.search(content):
             continue
-        content = _expand_decl_imports(content, path.parent)
+        root = Path(stdlib).resolve()
+        pdir = path.parent.resolve()
+        try:
+            content = _expand_decl_imports(content, pdir, stdlib_root=root)
+        except DeclImportError:
+            continue
         protocols.update(_extract_protocols_from_decl(content))
         c_f, v_b = _extract_component_features_and_variants(content)
         comp_features.update(c_f)
@@ -168,7 +216,12 @@ def get_stdlib_component_decl(component_name: str) -> str | None:
         except OSError:
             continue
         if comp_or_variant_re.search(content):
-            return _expand_decl_imports(content, path.parent)
+            root = Path(stdlib).resolve()
+            pdir = path.parent.resolve()
+            try:
+                return _expand_decl_imports(content, pdir, stdlib_root=root)
+            except DeclImportError:
+                continue
     return None
 
 
@@ -424,39 +477,52 @@ def _expand_decl_imports(
     content: str,
     base_path: Path,
     visited: set[Path] | None = None,
+    *,
+    stdlib_root: Path | None = None,
 ) -> str:
-    """Resolve `import "path"` lines by reading and inlining imported files.
+    """Resolve imports by reading and inlining imported files.
 
-    Paths are resolved relative to base_path (the directory of the current file).
-    Circular imports and repeated imports are skipped (each file inlined at most once).
-    Returns content with import lines replaced by the expanded content of the imported file.
+    - ``import <path>`` — only under ``stdlib_root`` (DECL stdlib layout).
+    - ``import \"path\"`` — relative to ``base_path`` (current file's directory), then
+      under ``stdlib_root`` if not found (compatibility).
+
+    Missing imports raise :exc:`DeclImportError`.
+
+    Circular imports are skipped (each file inlined at most once).
     """
     if visited is None:
         visited = set()
     base_path = base_path.resolve()
     if not base_path.is_dir():
-        return content
+        base_path = base_path.parent
+    sr = Path(stdlib_root).resolve() if stdlib_root is not None else None
     out_lines: list[str] = []
     for line in content.splitlines():
-        match = _IMPORT_LINE_RE.match(line)
-        if match:
-            path_str = match.group(1).strip().replace("\\", "/")
-            resolved = (base_path / path_str).resolve()
-            if resolved in visited:
-                continue
-            if not resolved.is_file():
-                out_lines.append(line)
-                continue
-            visited.add(resolved)
-            try:
-                sub_content = resolved.read_text()
-            except OSError:
-                out_lines.append(line)
-                continue
-            expanded_sub = _expand_decl_imports(sub_content, resolved.parent, visited)
-            out_lines.append(expanded_sub)
+        sm = _IMPORT_SYSTEM_RE.match(line)
+        qm = _IMPORT_QUOTED_RE.match(line) if not sm else None
+        if sm:
+            path_str = sm.group(1).strip()
+            resolved = _resolve_import_path(path_str, base_path, sr, is_system=True)
+        elif qm:
+            path_str = qm.group(1).strip()
+            resolved = _resolve_import_path(path_str, base_path, sr, is_system=False)
         else:
             out_lines.append(line)
+            continue
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        try:
+            sub_content = resolved.read_text()
+        except OSError as exc:
+            raise DeclImportError(path_str, [resolved], system=bool(sm)) from exc
+        expanded_sub = _expand_decl_imports(
+            sub_content,
+            resolved.parent,
+            visited,
+            stdlib_root=sr,
+        )
+        out_lines.append(expanded_sub)
     return "\n".join(out_lines)
 
 
@@ -495,9 +561,10 @@ TOOL_DEFINITIONS: list[dict] = [
         "function": {
             "name": "get_part_datasheet",
             "description": (
-                "Download a component datasheet PDF from a URL and extract its text "
-                "content. Returns the first ~8000 characters covering pinout, "
-                "electrical characteristics, and absolute maximum ratings."
+                "Download a component datasheet PDF and return an overview: "
+                "total page count, total character count, and the text of the "
+                "first 2 pages. Use read_datasheet_pages to read further pages "
+                "(e.g. pinout tables, electrical specs, application circuits)."
             ),
             "parameters": {
                 "type": "object",
@@ -508,6 +575,36 @@ TOOL_DEFINITIONS: list[dict] = [
                     },
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_datasheet_pages",
+            "description": (
+                "Read specific pages from a previously downloaded datasheet PDF. "
+                "Call get_part_datasheet first to download and see page count. "
+                "Use this to iteratively read pinout tables, electrical specs, "
+                "application circuits, and other sections on later pages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Same URL passed to get_part_datasheet",
+                    },
+                    "start_page": {
+                        "type": "integer",
+                        "description": "First page to read (0-indexed)",
+                    },
+                    "end_page": {
+                        "type": "integer",
+                        "description": "Last page to read (inclusive, 0-indexed)",
+                    },
+                },
+                "required": ["url", "start_page", "end_page"],
             },
         },
     },
@@ -634,39 +731,99 @@ def search_parts(query: str, top: int | None = None) -> str:
     return json.dumps({"query": query, "count": len(results), "results": results}, indent=2)
 
 
-@_register("get_part_datasheet")
-def get_part_datasheet(url: str) -> str:
+_pdf_cache: dict[str, list[str]] = {}
+
+_DATASHEET_PAGE_CAP = 6000
+
+
+def _ensure_pdf_cached(url: str) -> list[str] | str:
+    """Download PDF if not cached. Returns list of page texts or an error string."""
+    if url in _pdf_cache:
+        return _pdf_cache[url]
+
     if not url or not url.startswith("http"):
-        return json.dumps({"error": "Invalid datasheet URL"})
+        return "Invalid datasheet URL"
 
     try:
         resp = requests.get(url, timeout=30, headers={"User-Agent": "circuitd/1.0"})
         resp.raise_for_status()
     except Exception as exc:
-        return json.dumps({"error": f"Failed to download datasheet: {exc}"})
+        return f"Failed to download datasheet: {exc}"
 
     try:
         import pymupdf
     except ImportError:
-        return json.dumps({"error": "pymupdf not installed -- run: pip install pymupdf"})
+        return "pymupdf not installed -- run: pip install pymupdf"
 
     try:
         pdf_bytes = resp.content
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        text_parts: list[str] = []
-        total = 0
+        pages: list[str] = []
         for page in doc:
-            page_text = page.get_text()
-            text_parts.append(page_text)
-            total += len(page_text)
-            if total >= config.DATASHEET_MAX_CHARS:
-                break
+            pages.append(page.get_text())
         doc.close()
-        full_text = "\n".join(text_parts)[:config.DATASHEET_MAX_CHARS]
     except Exception as exc:
-        return json.dumps({"error": f"Failed to parse PDF: {exc}"})
+        return f"Failed to parse PDF: {exc}"
 
-    return json.dumps({"url": url, "text": full_text})
+    _pdf_cache[url] = pages
+    return pages
+
+
+@_register("get_part_datasheet")
+def get_part_datasheet(url: str) -> str:
+    pages = _ensure_pdf_cached(url)
+    if isinstance(pages, str):
+        return json.dumps({"error": pages})
+
+    total_chars = sum(len(p) for p in pages)
+    preview: dict[str, str] = {}
+    preview_chars = 0
+    for i, text in enumerate(pages[:3]):
+        preview[str(i)] = text[:_DATASHEET_PAGE_CAP]
+        preview_chars += len(preview[str(i)])
+        if preview_chars >= _DATASHEET_PAGE_CAP:
+            break
+
+    return json.dumps({
+        "url": url,
+        "total_pages": len(pages),
+        "total_chars": total_chars,
+        "hint": (
+            "First pages shown below. Use read_datasheet_pages(url, start_page, end_page) "
+            "to read pinout tables, electrical specs, and application circuits on later pages."
+        ),
+        "pages": preview,
+    })
+
+
+@_register("read_datasheet_pages")
+def read_datasheet_pages(url: str, start_page: int, end_page: int) -> str:
+    pages = _ensure_pdf_cached(url)
+    if isinstance(pages, str):
+        return json.dumps({"error": pages})
+
+    start_page = max(0, int(start_page))
+    end_page = min(len(pages) - 1, int(end_page))
+    if start_page > end_page:
+        return json.dumps({"error": f"start_page ({start_page}) > end_page ({end_page})"})
+
+    result: dict[str, str] = {}
+    total = 0
+    for i in range(start_page, end_page + 1):
+        text = pages[i]
+        if total + len(text) > _DATASHEET_PAGE_CAP:
+            text = text[:max(0, _DATASHEET_PAGE_CAP - total)]
+        result[str(i)] = text
+        total += len(text)
+        if total >= _DATASHEET_PAGE_CAP:
+            break
+
+    return json.dumps({
+        "url": url,
+        "pages_returned": f"{start_page}-{start_page + len(result) - 1}",
+        "total_pages": len(pages),
+        "pages": result,
+    })
 
 
 @_register("list_stdlib")
@@ -698,7 +855,9 @@ def read_stdlib_file(path: str) -> str:
         return json.dumps({"error": f"File not found: {path}"})
     try:
         content = target.read_text()
-        content = _expand_decl_imports(content, target.parent)
+        root = config.STDLIB_PATH.resolve()
+        pdir = target.parent.resolve()
+        content = _expand_decl_imports(content, pdir, stdlib_root=root)
         return content
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -867,8 +1026,16 @@ def _run_decl_check(content: str, base_path: Path | None = None) -> tuple[str, s
     """
     content = _fix_common_issues(content)
     expand_base = base_path if base_path is not None else getattr(config, "STDLIB_PATH", None)
-    if "import " in content and expand_base is not None and Path(expand_base).is_dir():
-        content = _expand_decl_imports(content, Path(expand_base))
+    if "import " in content and expand_base is not None:
+        eb = Path(expand_base).resolve()
+        if not eb.is_dir():
+            eb = eb.parent
+        sr = getattr(config, "STDLIB_PATH", None)
+        stdlib = Path(sr).resolve() if sr and Path(sr).is_dir() else None
+        try:
+            content = _expand_decl_imports(content, eb, stdlib_root=stdlib)
+        except DeclImportError as exc:
+            return "", str(exc), False
     with tempfile.NamedTemporaryFile(mode="w", suffix=".decl", delete=False) as f:
         f.write(content)
         tmp_path = f.name
@@ -891,6 +1058,153 @@ def _run_decl_check(content: str, base_path: Path | None = None) -> tuple[str, s
         Path(tmp_path).unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Requires extraction (for completeness checks)
+# ---------------------------------------------------------------------------
+
+_REQUIRES_ENTRY_RE = re.compile(
+    r"(\w+)\s*(?:\{([^}]*)\})?\s*(?:\*\s*(\d+))?"
+)
+
+
+def extract_requires_from_decl(
+    content: str,
+) -> list[tuple[str, dict[str, str], int]]:
+    """Parse requires blocks from DECL and return flat list of needed support components.
+
+    For every component *instantiated* in the schematic, collects its requires entries.
+    Handles variants by resolving to their base component's requires.
+    Returns list of (component_type, {attr: value_str}, count) tuples.
+    """
+    comp_requires: dict[str, list[tuple[str, dict[str, str], int]]] = {}
+    comp_re = re.compile(r"component\s+(\w+)\s*\{", re.MULTILINE)
+    pos = 0
+    while True:
+        m = comp_re.search(content, pos)
+        if not m:
+            break
+        comp_name = m.group(1)
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(content) and depth > 0:
+            if content[i] == "{":
+                depth += 1
+            elif content[i] == "}":
+                depth -= 1
+            i += 1
+        block = content[start : i - 1]
+
+        req_m = re.search(r"requires\s*\{", block)
+        entries: list[tuple[str, dict[str, str], int]] = []
+        if req_m:
+            rstart = req_m.end()
+            rdepth = 1
+            ri = rstart
+            while ri < len(block) and rdepth > 0:
+                if block[ri] == "{":
+                    rdepth += 1
+                elif block[ri] == "}":
+                    rdepth -= 1
+                ri += 1
+            req_body = block[rstart : ri - 1]
+            for line in req_body.strip().splitlines():
+                line = line.strip()
+                if not line or line.startswith("//"):
+                    continue
+                em = _REQUIRES_ENTRY_RE.match(line)
+                if em:
+                    comp_type = em.group(1)
+                    attrs: dict[str, str] = {}
+                    if em.group(2):
+                        for pair in re.findall(r"(\w+)\s*=\s*(\S+)", em.group(2)):
+                            attrs[pair[0]] = pair[1]
+                    count = int(em.group(3)) if em.group(3) else 1
+                    entries.append((comp_type, attrs, count))
+        comp_requires[comp_name] = entries
+        pos = i
+
+    variant_to_base: dict[str, str] = {}
+    for vm in re.finditer(r"variant\s+(\w+)\s+of\s+(\w+)", content):
+        variant_to_base[vm.group(1)] = vm.group(2)
+
+    instance_re = re.compile(r"instance\s+\w+\s*:\s*(\w+)", re.MULTILINE)
+    result: list[tuple[str, dict[str, str], int]] = []
+    seen_types: set[str] = set()
+    for im in instance_re.finditer(content):
+        ctype = im.group(1)
+        if ctype in seen_types:
+            continue
+        seen_types.add(ctype)
+        if ctype in comp_requires:
+            result.extend(comp_requires[ctype])
+        elif ctype in variant_to_base:
+            base = variant_to_base[ctype]
+            if base in comp_requires:
+                result.extend(comp_requires[base])
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Unconnected pin promotion
+# ---------------------------------------------------------------------------
+
+_W001_RE = re.compile(
+    r"\[W001\]\s*Pin\s+'(\w+)'\s+on\s+instance\s+'(\w+)'\s+\((\w+)\)\s+is\s+not\s+connected"
+)
+
+
+def _count_pins_per_component(decl: str) -> dict[str, int]:
+    """Count declared pins for each component in the DECL source."""
+    counts: dict[str, int] = {}
+    comp_re = re.compile(r"component\s+(\w+)\s*\{", re.MULTILINE)
+    pos = 0
+    while True:
+        m = comp_re.search(decl, pos)
+        if not m:
+            break
+        comp_name = m.group(1)
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(decl) and depth > 0:
+            if decl[i] == "{":
+                depth += 1
+            elif decl[i] == "}":
+                depth -= 1
+            i += 1
+        block = decl[start : i - 1]
+        pins_m = re.search(r"pins\s*\{([^}]*)\}", block, re.DOTALL)
+        if pins_m:
+            pin_lines = re.findall(r"(?:^\s*\d+\s*:|^\s*\w+\s*:)\s*\w+", pins_m.group(1), re.MULTILINE)
+            counts[comp_name] = len(pin_lines)
+        pos = i
+    return counts
+
+
+def _promote_w001_for_small_components(
+    checker_output: str, decl: str,
+) -> list[dict]:
+    """Parse W001 warnings; promote to E012 errors for components with <=8 pins."""
+    pin_counts = _count_pins_per_component(decl)
+    errors: list[dict] = []
+    for m in _W001_RE.finditer(checker_output):
+        pin_name, inst_name, comp_type = m.group(1), m.group(2), m.group(3)
+        n_pins = pin_counts.get(comp_type, 999)
+        if n_pins <= 8:
+            errors.append({
+                "code": "E012",
+                "line": 0,
+                "message": (
+                    f"Unconnected pin '{pin_name}' on instance '{inst_name}' ({comp_type}). "
+                    f"All pins on support components (resistors, capacitors, connectors, LEDs) "
+                    f"must be connected. Connect {inst_name}.{pin_name} to the appropriate net or pin."
+                ),
+                "entities": [f"{inst_name}.{pin_name}"],
+            })
+    return errors
+
+
 def validate_decl_structured(content: str, base_path: Path | None = None) -> tuple[str, list[dict]]:
     """Validate .decl content; return (human-readable output, structured errors).
 
@@ -909,18 +1223,25 @@ def validate_decl_structured(content: str, base_path: Path | None = None) -> tup
         output += ("\n" + stderr) if output else stderr
     if not output:
         output = "(no output)"
-    output = _annotate_errors(output, _fix_common_issues(content))
+    fixed = _fix_common_issues(content)
+    output = _annotate_errors(output, fixed)
     structured = [] if is_ok else _parse_validation_errors(stdout + "\n" + stderr)
-    protocol_errors = validate_decl_protocol_pins(_fix_common_issues(content))
+    protocol_errors = validate_decl_protocol_pins(fixed)
     if protocol_errors:
         structured = structured + protocol_errors
         output += "\n\nProtocol pin validation failed:\n" + "\n".join(
             e.get("message", "") for e in protocol_errors
         )
-    if is_ok and not protocol_errors:
+    unconnected_errors = _promote_w001_for_small_components(stdout + "\n" + stderr, fixed)
+    if unconnected_errors:
+        structured = structured + unconnected_errors
+        output += "\n\nUnconnected pin errors (support components):\n" + "\n".join(
+            e.get("message", "") for e in unconnected_errors
+        )
+    if is_ok and not protocol_errors and not unconnected_errors:
         output += (
-            "\n\nVALIDATION PASSED. W001 (unconnected pin) warnings are expected "
-            "for unused MCU pins and can be ignored. Do NOT re-validate. "
+            "\n\nVALIDATION PASSED. W001 (unconnected pin) warnings on MCU GPIO "
+            "pins can be ignored. Do NOT re-validate. "
             "Output the final .decl file in a ```decl code block now."
         )
     return output, structured

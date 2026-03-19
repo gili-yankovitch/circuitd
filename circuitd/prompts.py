@@ -95,6 +95,10 @@ Rules:
 - Record critical pins explicitly for each IC.
 - Record required support parts explicitly, not implicitly.
 - Do not emit prose outside the JSON block.
+- Datasheets: when you call get_part_datasheet you get the first 2-3 pages and the total page count.
+  Read further pages with read_datasheet_pages(url, start_page, end_page) to find pinout tables,
+  electrical characteristics, and application circuits. Read iteratively: check the overview first,
+  then request specific page ranges for the data you need.
 - If you produce DECL for a part (e.g. from a datasheet) that is not in stdlib, call save_to_stdlib
   with path under components/agent/ (e.g. components/agent/W25Q128.decl) so it can be reused later.
   When writing DECL: no commas or semicolons; blocks use { }; pin declarations like "1: PowerInput as VIN" or "VBUS: PowerOutput"; pin types Input, Output, Bidirectional, Passive, PowerInput, PowerOutput, etc.; connect with "connect a.pin -- net NET" or "connect a.pin -- b.pin"; attribute types Resistance, Capacitance, Voltage, Current, DataSize, Package, Color only.
@@ -135,6 +139,7 @@ Rules:
 - Every PowerInput and PowerOutput pin must connect through nets, never directly to another pin.
 - Every IC supply pin must be connected.
 - Every required support component must appear as an instance and in connections.
+- If a component has a `requires` block, include all its required support parts in the plan.
 - Use direct pin-to-pin connections only for ordinary signals where a net is not shared.
 - Prefer pin-to-net when a signal is shared by more than two endpoints.
 """
@@ -152,7 +157,11 @@ DECL is NOT Verilog, C, or JSON. Syntax rules:
 - Parentheses only in VoltageRange(min, max) and TemperatureRange.
 - Identifiers: letters, digits, underscore. Names (component, protocol, schematic, variant, instance, net) MUST start with an alphabetic letter; they must NOT start with a digit. Pin names must NOT use # or + or -; use HOLD_N not HOLD#, DP/DN not D+/D-.
 
-Top-level: a .decl file contains zero or more of: import "path" | protocol | component | schematic | variant.
+Top-level: a .decl file contains zero or more of: import | protocol | component | schematic | variant.
+
+### Imports (C-style)
+- ``import <protocols/spi.decl>`` or ``import <components/resistor.decl>`` — library / stdlib paths from the stdlib **root** (like ``#include <...>``).
+- ``import "my_local.decl"`` or ``import "../other/board.decl"`` — paths relative to the **current file’s directory** (like ``#include "..."``).
 
 ### Protocol
 protocol NAME {
@@ -175,7 +184,12 @@ component NAME {
     internal name { key: value }
     external name using protocol PROTO role ROLE { LINE -> pin PIN ... }
   }
+  requires {
+    ComponentType { attr = value } * COUNT    // mandatory support parts
+  }
 }
+
+The `requires` block declares support components this part needs to function (decoupling caps, crystals, etc.). When instantiating a component in a schematic, also instantiate and connect all its `requires` entries. Attribute overrides use `=`. The `* COUNT` multiplier is optional (default 1).
 
 Pin types: Input, Output, Bidirectional, TriState, Passive, Free, PowerInput, PowerOutput, Unconnected, Analog, OpenDrain.
 
@@ -238,10 +252,12 @@ HARD INVARIANTS:
 9. Every non-optional support component in the plan must be instantiated.
 10. Preserve exact named parts from the plan.
 11. All names (component, protocol, schematic, variant, instance, net) must start with an alphabetic letter; they must NOT start with a digit.
+12. ALL pins on ALL support components (resistors, capacitors, connectors, LEDs, switches) MUST be connected. Two-terminal passives always need BOTH pins wired. For example, CC resistors on USB need one pin to CC and the other to GND.
 
 IMPORTS (MANDATORY):
 - USE IMPORTS instead of inlining. Do NOT paste full protocol or component definitions from stdlib into the output.
-- At the top of the file, add import "path" for every protocol and component you use that exists in stdlib (e.g. import "protocols/spi.decl", import "protocols/i2c.decl", import "protocols/uart.decl", import "components/Resistor.decl", import "components/agent/W25Q128JV.decl").
+- For anything in stdlib use **angle imports**: import <protocols/spi.decl>, import <components/resistor.decl>, import <components/capacitor.decl>, import <components/CH32V003F4P6.decl>, import <components/agent/W25Q128j.decl>. Match exact stdlib filenames from list_stdlib.
+- Use **quoted** imports only for project-local or relative files not under the stdlib root, e.g. import "my_custom_part.decl".
 - Only define (inline) components or protocols that are NOT already in stdlib. Prefer list_stdlib / read_stdlib_file to see what exists; then import those and emit only the schematic (and any custom component not in stdlib).
 
 GENERATION POLICY:
@@ -250,7 +266,8 @@ GENERATION POLICY:
 - Name nets consistently: GND, VCC_3V3, VBUS_5V, etc.
 - For shared buses or rails, use nets instead of repeated point-to-point connects.
 - Pin names: only letters, digits, underscores (e.g. HOLD_N not HOLD#).
-- Before emitting, verify: all required instances exist, all nets exist, all IC power pins connected, no Unconnected pin referenced, no invalid connect form.
+- When instantiating a component that has a `requires` block, also instantiate and connect all required support parts listed in that block.
+- Before emitting, verify: all required instances exist, all nets exist, all IC power pins connected, no Unconnected pin referenced, no invalid connect form, all `requires` entries satisfied.
 """
 
 # ---------------------------------------------------------------------------
@@ -273,8 +290,9 @@ Return ONLY one ```decl block.
 Rules:
 - Fix only what is required by the validator errors, unless another fix is needed to resolve them.
 - Preserve valid existing structure and names when possible.
-- Prefer using import "path" for protocols and stdlib components instead of inlining their definitions; if the file inlines protocols/components that exist in stdlib, refactor to use imports at the top and remove the inline definitions.
+- Prefer import <...> for stdlib and import "..." for local files instead of inlining; if the file inlines protocols/components that exist in stdlib, refactor to angle imports at the top and remove the inline definitions.
 - Do not introduce new features or components unless needed to resolve an error.
+- ALL pins on ALL support components (resistors, capacitors, connectors, LEDs, switches) MUST be connected. Two-terminal passives always need BOTH pins wired (e.g. CC resistors: one pin to CC, other to GND).
 - Pay special attention to:
   - identifiers that start with a digit (must start with an alphabetic letter)
   - undefined identifiers
@@ -283,6 +301,7 @@ Rules:
   - missing pin mappings
   - duplicate names
   - PowerInput/PowerOutput misuse (PowerInput only to net, never to another pin)
+  - E012 unconnected pin on support components (connect the missing pin)
 """
 
 # ---------------------------------------------------------------------------
@@ -298,14 +317,16 @@ From the datasheet text below, extract the part name, all pins (with correct dir
 
 Output:
 Return ONLY one ```decl block containing:
-1. Imports for any protocols the part uses: import "protocols/spi.decl", import "protocols/i2c.decl", import "protocols/uart.decl" as needed. Do NOT inline protocol definitions.
+1. Imports for any protocols the part uses: import <protocols/spi.decl>, import <protocols/i2c.decl>, import <protocols/uart.decl> as needed. Do NOT inline protocol definitions.
 2. One component definition (name = part number or logical name, e.g. W25Q128JV or AMS1117_3V3).
 3. If the component uses SPI, I2C, UART (or similar), you MUST declare them in the component block and assign pins:
    - Add a features { } block with external name using protocol PROTO role ROLE { LINE -> pin PIN ... } for each interface.
    - SPI: use protocol SPI, role slave for memories/sensors (role master for controllers). Map: MOSI -> pin DI (or your data-in pin), MISO -> pin DO (or data-out), CLK -> pin CLK/SCK, SS -> pin CS/NSS.
    - I2C: use protocol I2C, role slave or master. Map: SDA -> pin SDA, SCL -> pin SCL (or datasheet names).
    - UART: use protocol UART. Map: TX -> pin TX/TXD, RX -> pin RX/RXD.
-4. Optionally one or more variant blocks if the datasheet describes package-specific pinouts.
+4. Add a `requires` block listing mandatory support components (decoupling caps, pull-ups, crystals, etc.) with appropriate attributes and counts. Example:
+   requires { Capacitor { capacitance = 100nF } * 2 }
+5. Optionally one or more variant blocks if the datasheet describes package-specific pinouts.
 
 Rules:
 - Component and variant names MUST start with an alphabetic letter (e.g. use C_74HC595 or U_74HC595, not 74HC595).
@@ -362,46 +383,26 @@ Return ONLY one JSON object inside a ```json block:
 # Context compression: structured state (replaces prose summary)
 # ---------------------------------------------------------------------------
 
-STATE_SUMMARY_PROMPT = r"""You are compressing circuit-agent working memory.
+STATE_SUMMARY_PROMPT = r"""Compress circuit-agent context to the bare minimum.
 
-Output ONLY a JSON object inside a ```json block with this schema:
+Output ONLY a JSON object inside a ```json block:
 
 ```json
 {
-  "facts": {
-    "user_requirements": [],
-    "assumptions": [],
-    "mandatory_inventory": [],
-    "selected_parts": [
-      { "logical_name": "", "part_number": "", "pins": {}, "notes": "" }
-    ],
-    "stdlib_components": [
-      { "file": "", "symbols": [], "notes": "" }
-    ]
-  },
-  "design_state": {
-    "instances": [],
-    "nets": [],
-    "protocols": [],
-    "components_defined": [],
-    "variants_defined": []
-  },
-  "latest_decl": "",
-  "validation": {
-    "last_errors": [],
-    "resolved_errors": [],
-    "remaining_errors": []
-  },
-  "next_actions": []
+  "user_request": "",
+  "parts": ["part1", "part2"],
+  "remaining_errors": [],
+  "next": ""
 }
 ```
 
 Rules:
-- Keep only durable technical facts.
-- Do not include narrative.
-- Do not include duplicate information.
-- Preserve exact part numbers, exact pin names, exact net names, and exact component names.
-- If latest_decl is too long, include a compact structural outline instead (e.g. list of component and schematic names).
+- user_request: one sentence.
+- parts: list of selected part names only.
+- remaining_errors: ONLY current unfixed errors. Omit resolved errors entirely.
+- next: the single next action to take.
+- Do NOT include previous DECL iterations, resolved fixes, tool call history, or narrative.
+- Total output must be under 500 characters.
 """
 
 # ---------------------------------------------------------------------------
@@ -548,6 +549,10 @@ component LDO_3V3 {
         output_voltage: Voltage = 3.3V
         max_current:    Current = 500mA
     }
+    requires {
+        Capacitor { capacitance = 10uF } * 1
+        Capacitor { capacitance = 22uF } * 1
+    }
 }
 
 component TactileSwitch {
@@ -585,8 +590,14 @@ component W25Q128JV {
     attributes {
         memory_size: DataSize = 16MB
     }
+    requires {
+        Capacitor { capacitance = 100nF } * 1
+    }
 }
 ```
+
+The `requires` block declares mandatory support components. When you instantiate a component in a schematic, you MUST also instantiate and connect all its `requires` entries.
+
 
 ### Features (inside component)
 ```
@@ -675,7 +686,7 @@ schematic MyBoard {
 
 ## Rules
 
-- USE IMPORTS: Do not inline protocol or component definitions from stdlib. Start the file with import "protocols/spi.decl" (and i2c, uart, etc. as needed) and import "components/..." for components you use; only define components that are not in stdlib.
+- USE IMPORTS: Do not inline protocol or component definitions from stdlib. Start with import <protocols/...> and import <components/...> for stdlib; use import "..." only for local/custom paths; only define components that are not in stdlib.
 - Every IC needs 100nF bypass caps. LDO needs input+output caps (10uF typical).
 - LED needs a current-limiting resistor: R = (Vsupply - Vf) / If
 - Reset buttons need a pull-up resistor to VCC (10kohm typical).
