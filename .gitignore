@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+env/
+venv/
+.venv/
+.env
+.DS_Store
+
+# Logs and prompts
+*.log
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Local API keys and secrets
+*.key
+.env.*
+
+*.decl
